@@ -121,6 +121,7 @@ export default function Home() {
   const [inferences, setInferences] = useState<AlloraInference[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [winStats, setWinStats] = useState<WinRateStats>({ total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_win: 0, avg_loss: 0 });
+  const [livePrice, setLivePrice] = useState<number>(0);
 
   // Local Form state
   const [instrument, setInstrument] = useState("EUR_USD");
@@ -200,6 +201,13 @@ export default function Home() {
       const statsRes = await fetch(`${backendURL}/api/stats`);
       const statsData = await statsRes.json();
       if (statsData && typeof statsData.win_rate === 'number') setWinStats(statsData);
+
+      // Fetch live tick price (updated every strategy tick, much fresher than candle close)
+      try {
+        const priceRes = await fetch(`${backendURL}/api/price`);
+        const priceData = await priceRes.json();
+        if (priceData?.price) setLivePrice(priceData.price);
+      } catch { /* silently ignore — will use candle fallback */ }
 
     } catch (err) {
       setIsConnected(false);
@@ -953,7 +961,14 @@ export default function Home() {
                       {positions.map((pos) => {
                         const isLong = pos.units > 0;
                         const isMatchingInstrument = pos.instrument === status?.runner_config.instrument;
-                        const currentPrice = (isMatchingInstrument && candles.length > 0) ? candles[candles.length - 1].close : pos.open_price;
+                        // Use the live tick price when available (updated each strategy tick).
+                        // Fall back to last candle close, then entry price if neither is ready.
+                        const currentPrice =
+                          (isMatchingInstrument && livePrice > 0)
+                            ? livePrice
+                            : (isMatchingInstrument && candles.length > 0)
+                            ? candles[candles.length - 1].close
+                            : pos.open_price;
                         const floatingPnl = (currentPrice - pos.open_price) * pos.units;
 
                         return (

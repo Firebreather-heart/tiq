@@ -40,6 +40,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/inferences", s.handleInferences)
 	mux.HandleFunc("GET /api/candles", s.handleCandles)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
+	mux.HandleFunc("GET /api/price", s.handlePrice)
 	mux.HandleFunc("POST /api/trade/manual", s.handleManualTrade)
 	mux.HandleFunc("POST /api/trade/close", s.handleClosePosition)
 
@@ -245,4 +246,22 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, stats)
+}
+
+// handlePrice returns the latest live price the engine knows about for a given instrument.
+// This is updated every strategy tick from the real market feed — much fresher than candle close.
+func (s *Server) handlePrice(w http.ResponseWriter, r *http.Request) {
+	instrument := r.URL.Query().Get("instrument")
+	if instrument == "" {
+		instrument = s.runner.GetConfig().Instrument
+	}
+	price, ok := s.engine.GetPrice(instrument)
+	if !ok {
+		s.writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no live price available for %s", instrument))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"instrument": instrument,
+		"price":      price,
+	})
 }
