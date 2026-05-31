@@ -397,7 +397,15 @@ export default function Home() {
         {/* Floating TradingView-style HUD Info */}
         <div className="absolute top-2 left-4 flex items-center gap-3 text-[11px] font-mono font-semibold text-[#848e9c] z-10 select-none pointer-events-none">
           <span className="text-[#d1d4dc] font-bold">{status?.runner_config.instrument}</span>
-          <span className="bg-[#2a2e39] px-1.5 py-0.5 rounded text-[9px] text-[#d1d4dc]">5m</span>
+          <span className="bg-[#2a2e39] px-1.5 py-0.5 rounded text-[9px] text-[#d1d4dc]">{(() => {
+            if (candles.length < 2) return '?';
+            const diffMs = new Date(candles[1].time).getTime() - new Date(candles[0].time).getTime();
+            const diffMin = Math.round(diffMs / 60000);
+            if (diffMin < 60) return `${diffMin}m`;
+            const diffH = Math.round(diffMin / 60);
+            if (diffH < 24) return `${diffH}h`;
+            return `${Math.round(diffH / 24)}d`;
+          })()}</span>
           {(() => {
             const idx = hoveredIndex !== null ? hoveredIndex : candles.length - 1;
             const candle = candles[idx];
