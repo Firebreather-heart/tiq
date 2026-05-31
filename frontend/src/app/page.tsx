@@ -97,6 +97,16 @@ interface Candle {
   close: number;
 }
 
+interface WinRateStats {
+  total_trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  total_pnl: number;
+  avg_win: number;
+  avg_loss: number;
+}
+
 export default function Home() {
   // Connection state
   const [backendURL, setBackendURL] = useState("http://localhost:8080");
@@ -110,6 +120,7 @@ export default function Home() {
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [inferences, setInferences] = useState<AlloraInference[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
+  const [winStats, setWinStats] = useState<WinRateStats>({ total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_win: 0, avg_loss: 0 });
 
   // Local Form state
   const [instrument, setInstrument] = useState("EUR_USD");
@@ -129,6 +140,10 @@ export default function Home() {
 
   // User Guide Modal state
   const [showManual, setShowManual] = useState(false);
+
+  // Hover and mouse states for TradingView-style interactive crosshair
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const [mouseCoords, setMouseCoords] = useState<{ x: number; y: number } | null>(null);
 
   // Log terminal container ref
   const terminalContainerRef = useRef<HTMLDivElement>(null);
@@ -180,6 +195,11 @@ export default function Home() {
       const candlesRes = await fetch(`${backendURL}/api/candles?count=50`);
       const candlesData = await candlesRes.json();
       setCandles(Array.isArray(candlesData) ? candlesData : []);
+
+      // Fetch win rate stats
+      const statsRes = await fetch(`${backendURL}/api/stats`);
+      const statsData = await statsRes.json();
+      if (statsData && typeof statsData.win_rate === 'number') setWinStats(statsData);
 
     } catch (err) {
       setIsConnected(false);
@@ -311,12 +331,11 @@ export default function Home() {
       alert("Error sending order request.");
     }
   };
-
   // SVG Chart Calculations
   const renderChart = () => {
     if (candles.length === 0) {
       return (
-        <div className="h-64 flex items-center justify-center text-slate-500 bg-slate-950/40 rounded-xl border border-slate-900">
+        <div className="h-64 flex items-center justify-center text-slate-500 bg-[#131722]/40 rounded-xl border border-[#2a2e39]">
           No candle data available. Ensure Oanda key is valid or backend is running.
         </div>
       );
@@ -324,10 +343,10 @@ export default function Home() {
 
     // Chart Dimensions
     const width = 800;
-    const height = 300;
-    const paddingLeft = 10;
-    const paddingRight = 60;
-    const paddingTop = 20;
+    const height = 450;
+    const paddingLeft = 15;
+    const paddingRight = 65;
+    const paddingTop = 35;
     const paddingBottom = 30;
 
     const chartW = width - paddingLeft - paddingRight;
@@ -353,28 +372,123 @@ export default function Home() {
     const fastEmaVals = calculateEmaArray(candles.map(c => c.close), fastPeriod);
     const slowEmaVals = calculateEmaArray(candles.map(c => c.close), slowPeriod);
 
+    const currentPrice = candles[candles.length - 1].close;
+    const decimals = currentPrice > 1000 ? 2 : 5;
+
+    const maxVolume = Math.max(...candles.map(c => c.volume)) || 1;
+
+    // Calculate price at mouse coordinate
+    let hoverPrice = 0;
+    if (mouseCoords) {
+      const priceRatio = (height - paddingBottom - mouseCoords.y) / chartH;
+      hoverPrice = minPrice + priceRatio * (maxPrice - minPrice);
+    }
+
     return (
-      <div className="relative bg-slate-950/80 rounded-xl p-4 border border-slate-800/60 shadow-inner">
-        <div className="absolute top-2 left-4 text-xs font-semibold text-slate-400 bg-slate-900/80 py-1 px-2.5 rounded-full border border-slate-800">
-          {status?.runner_config.instrument} • {status?.runner_config.granularity} Candles
+      <div className="relative bg-[#131722] rounded-xl p-4 border border-[#2a2e39] shadow-2xl selection:bg-[#2962ff]/30">
+        {/* Floating TradingView-style HUD Info */}
+        <div className="absolute top-2 left-4 flex items-center gap-3 text-[11px] font-mono font-semibold text-[#848e9c] z-10 select-none pointer-events-none">
+          <span className="text-[#d1d4dc] font-bold">{status?.runner_config.instrument}</span>
+          <span className="bg-[#2a2e39] px-1.5 py-0.5 rounded text-[9px] text-[#d1d4dc]">5m</span>
+          {(() => {
+            const idx = hoveredIndex !== null ? hoveredIndex : candles.length - 1;
+            const candle = candles[idx];
+            const isGreen = candle.close >= candle.open;
+            const colorClass = isGreen ? "text-[#089981]" : "text-[#f23645]";
+            return (
+              <div className="flex gap-2">
+                <span>O<span className={colorClass}>{candle.open.toFixed(decimals)}</span></span>
+                <span>H<span className={colorClass}>{candle.high.toFixed(decimals)}</span></span>
+                <span>L<span className={colorClass}>{candle.low.toFixed(decimals)}</span></span>
+                <span>C<span className={colorClass}>{candle.close.toFixed(decimals)}</span></span>
+                <span>V<span className={colorClass}>{candle.volume}</span></span>
+              </div>
+            );
+          })()}
         </div>
 
-        <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} className="overflow-visible">
-          {/* Grid lines */}
+        <svg
+          width="100%"
+          height={height}
+          viewBox={`0 0 ${width} ${height}`}
+          className="overflow-visible cursor-crosshair select-none"
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const mouseX = ((e.clientX - rect.left) / rect.width) * width;
+            const mouseY = ((e.clientY - rect.top) / rect.height) * height;
+
+            let idx = Math.round(((mouseX - paddingLeft) / chartW) * (candles.length - 1));
+            if (idx < 0) idx = 0;
+            if (idx >= candles.length) idx = candles.length - 1;
+
+            setHoveredIndex(idx);
+            setMouseCoords({ x: mouseX, y: mouseY });
+          }}
+          onMouseLeave={() => {
+            setHoveredIndex(null);
+            setMouseCoords(null);
+          }}
+        >
+          {/* Vertical Grid Lines */}
+          {Array.from({ length: 8 }).map((_, i) => {
+            const idx = Math.round((i / 7) * (candles.length - 1));
+            const x = xMap(idx);
+            return (
+              <line
+                key={`v-grid-${i}`}
+                x1={x}
+                y1={paddingTop}
+                x2={x}
+                y2={height - paddingBottom}
+                stroke="#2a2e39"
+                strokeWidth="0.5"
+                strokeDasharray="2,2"
+              />
+            );
+          })}
+
+          {/* Horizontal Grid Lines */}
           {[0, 0.25, 0.5, 0.75, 1].map((ratio, i) => {
             const price = maxPrice - ratio * (maxPrice - minPrice);
             const y = yMap(price);
             return (
-              <g key={i}>
-                <line x1={paddingLeft} y1={y} x2={width - paddingRight} y2={y} stroke="#1e293b" strokeDasharray="3,3" />
-                <text x={width - paddingRight + 5} y={y + 4} fill="#64748b" className="text-[10px] font-mono">
-                  {price.toFixed(5)}
+              <g key={`h-grid-${i}`}>
+                <line
+                  x1={paddingLeft}
+                  y1={y}
+                  x2={width - paddingRight}
+                  y2={y}
+                  stroke="#2a2e39"
+                  strokeWidth="0.5"
+                  strokeDasharray="2,2"
+                />
+                <text x={width - paddingRight + 6} y={y + 3.5} fill="#848e9c" className="text-[10px] font-mono">
+                  {price.toFixed(decimals)}
                 </text>
               </g>
             );
           })}
 
-          {/* Candlesticks */}
+          {/* Volume Bars (Background layer, bottom 15% of chart) */}
+          {candles.map((candle, idx) => {
+            const x = xMap(idx);
+            const barH = (candle.volume / maxVolume) * (chartH * 0.15);
+            const y = height - paddingBottom - barH;
+            const isGreen = candle.close >= candle.open;
+            const barW = Math.max(2, chartW / candles.length - 3);
+            return (
+              <rect
+                key={`vol-${idx}`}
+                x={x - barW / 2}
+                y={y}
+                width={barW}
+                height={Math.max(1.5, barH)}
+                fill={isGreen ? "rgba(8, 153, 129, 0.18)" : "rgba(242, 54, 69, 0.18)"}
+              />
+            );
+          })}
+
+          {/* Candlesticks (Foreground layer) */}
           {candles.map((candle, idx) => {
             const x = xMap(idx);
             const yOpen = yMap(candle.open);
@@ -383,25 +497,22 @@ export default function Home() {
             const yLow = yMap(candle.low);
 
             const isGreen = candle.close >= candle.open;
-            const strokeColor = isGreen ? "#10b981" : "#f43f5e";
-            const fillColor = isGreen ? "rgba(16,185,129,0.3)" : "rgba(244,63,94,0.3)";
-
-            const candleW = Math.max(2, chartW / candles.length - 4);
+            const color = isGreen ? "#089981" : "#f23645";
+            const candleW = Math.max(3, chartW / candles.length - 3);
 
             return (
-              <g key={idx}>
+              <g key={`candle-${idx}`}>
                 {/* Wick */}
-                <line x1={x} y1={yHigh} x2={x} y2={yLow} stroke={strokeColor} strokeWidth="1.5" />
+                <line x1={x} y1={yHigh} x2={x} y2={yLow} stroke={color} strokeWidth="1" />
                 {/* Body */}
                 <rect
                   x={x - candleW / 2}
                   y={Math.min(yOpen, yClose)}
                   width={candleW}
-                  height={Math.max(1, Math.abs(yOpen - yClose))}
-                  fill={fillColor}
-                  stroke={strokeColor}
-                  strokeWidth="1.5"
-                  rx="1"
+                  height={Math.max(1.5, Math.abs(yOpen - yClose))}
+                  fill={color}
+                  stroke={color}
+                  strokeWidth="1"
                 />
               </g>
             );
@@ -414,9 +525,8 @@ export default function Home() {
                 .map((val, idx) => (val > 0 ? `${idx === fastPeriod - 1 ? "M" : "L"} ${xMap(idx)} ${yMap(val)}` : ""))
                 .join(" ")}
               fill="none"
-              stroke="#6366f1"
+              stroke="#2962ff"
               strokeWidth="1.5"
-              strokeDasharray="2,2"
             />
           )}
 
@@ -427,15 +537,13 @@ export default function Home() {
                 .map((val, idx) => (val > 0 ? `${idx === slowPeriod - 1 ? "M" : "L"} ${xMap(idx)} ${yMap(val)}` : ""))
                 .join(" ")}
               fill="none"
-              stroke="#f59e0b"
+              stroke="#ff9800"
               strokeWidth="1.5"
             />
           )}
 
-          {/* Current Price Line */}
+          {/* Live Price Line (TradingView Blue Axis Tag) */}
           {(() => {
-            const currentPrice = candles[candles.length - 1].close;
-            const decimals = currentPrice > 1000 ? 2 : 5;
             const yCurrent = yMap(currentPrice);
             if (yCurrent >= paddingTop && yCurrent <= height - paddingBottom) {
               return (
@@ -445,24 +553,22 @@ export default function Home() {
                     y1={yCurrent}
                     x2={width - paddingRight}
                     y2={yCurrent}
-                    stroke="#06b6d4"
+                    stroke="#2962ff"
                     strokeWidth="1.5"
-                    strokeDasharray="2,2"
+                    strokeDasharray="4,2"
                   />
                   <rect
                     x={width - paddingRight + 2}
                     y={yCurrent - 7}
-                    width={52}
+                    width={60}
                     height={14}
-                    fill="#020617"
-                    stroke="#06b6d4"
-                    strokeWidth="1"
-                    rx="3"
+                    fill="#2962ff"
+                    rx="2"
                   />
                   <text
                     x={width - paddingRight + 6}
-                    y={yCurrent + 3}
-                    fill="#06b6d4"
+                    y={yCurrent + 3.5}
+                    fill="#ffffff"
                     className="text-[9px] font-mono font-bold"
                   >
                     {currentPrice.toFixed(decimals)}
@@ -473,10 +579,8 @@ export default function Home() {
             return null;
           })()}
 
-          {/* Entry Price Line */}
+          {/* Entry Price Line (TradingView Orange/Yellow Axis Tag) */}
           {positions.length > 0 && (() => {
-            const currentPrice = candles[candles.length - 1].close;
-            const decimals = currentPrice > 1000 ? 2 : 5;
             const entryPrice = positions[0].open_price;
             const yEntry = yMap(entryPrice);
             if (yEntry >= paddingTop && yEntry <= height - paddingBottom) {
@@ -487,24 +591,22 @@ export default function Home() {
                     y1={yEntry}
                     x2={width - paddingRight}
                     y2={yEntry}
-                    stroke="#a855f7"
+                    stroke="#ff9800"
                     strokeWidth="1.5"
                     strokeDasharray="4,4"
                   />
                   <rect
                     x={width - paddingRight + 2}
                     y={yEntry - 7}
-                    width={52}
+                    width={60}
                     height={14}
-                    fill="#020617"
-                    stroke="#a855f7"
-                    strokeWidth="1"
-                    rx="3"
+                    fill="#ff9800"
+                    rx="2"
                   />
                   <text
                     x={width - paddingRight + 6}
-                    y={yEntry + 3}
-                    fill="#a855f7"
+                    y={yEntry + 3.5}
+                    fill="#ffffff"
                     className="text-[9px] font-mono font-bold"
                   >
                     {entryPrice.toFixed(decimals)}
@@ -514,28 +616,105 @@ export default function Home() {
             }
             return null;
           })()}
+
+          {/* Interactive Crosshair overlay lines & labels */}
+          {hoveredIndex !== null && mouseCoords !== null && (
+            <g pointerEvents="none">
+              {/* Vertical line */}
+              <line
+                x1={xMap(hoveredIndex)}
+                y1={paddingTop}
+                x2={xMap(hoveredIndex)}
+                y2={height - paddingBottom}
+                stroke="#5d606b"
+                strokeWidth="1"
+                strokeDasharray="3,3"
+              />
+              {/* Horizontal line */}
+              {mouseCoords.y >= paddingTop && mouseCoords.y <= height - paddingBottom && (
+                <>
+                  <line
+                    x1={paddingLeft}
+                    y1={mouseCoords.y}
+                    x2={width - paddingRight}
+                    y2={mouseCoords.y}
+                    stroke="#5d606b"
+                    strokeWidth="1"
+                    strokeDasharray="3,3"
+                  />
+                  {/* Price label tag on right scale */}
+                  <rect
+                    x={width - paddingRight + 2}
+                    y={mouseCoords.y - 7}
+                    width={60}
+                    height={14}
+                    fill="#2a2e39"
+                    rx="2"
+                  />
+                  <text
+                    x={width - paddingRight + 6}
+                    y={mouseCoords.y + 3.5}
+                    fill="#d1d4dc"
+                    className="text-[9px] font-mono font-bold"
+                  >
+                    {hoverPrice.toFixed(decimals)}
+                  </text>
+                </>
+              )}
+              {/* Time tag on bottom scale */}
+              {(() => {
+                const hoverCandle = candles[hoveredIndex];
+                const formattedTime = new Date(hoverCandle.time).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                });
+                const tagX = xMap(hoveredIndex);
+                return (
+                  <g>
+                    <rect
+                      x={tagX - 22}
+                      y={height - paddingBottom + 2}
+                      width={44}
+                      height={12}
+                      fill="#2a2e39"
+                      rx="2"
+                    />
+                    <text
+                      x={tagX}
+                      y={height - paddingBottom + 11}
+                      textAnchor="middle"
+                      fill="#d1d4dc"
+                      className="text-[8px] font-mono font-bold"
+                    >
+                      {formattedTime}
+                    </text>
+                  </g>
+                );
+              })()}
+            </g>
+          )}
         </svg>
 
-        <div className="flex items-center gap-4 mt-2 justify-end text-[10px] text-slate-400 font-mono">
+        <div className="flex items-center gap-4 mt-2 justify-end text-[10px] text-slate-400 font-mono select-none">
           <div className="flex items-center gap-1.5">
-            <span className="w-3 h-0.5 bg-[#06b6d4] inline-block dashed" style={{ borderTop: "1.5px dashed #06b6d4" }}></span> Live Price
+            <span className="w-3 h-0.5 bg-[#2962ff] inline-block"></span> Live Price
           </div>
           {positions.length > 0 && (
             <div className="flex items-center gap-1.5">
-              <span className="w-3 h-0.5 bg-[#a855f7] inline-block dashed" style={{ borderTop: "1.5px dashed #a855f7" }}></span> Entry Price
+              <span className="w-3 h-0.5 bg-[#ff9800] inline-block dashed" style={{ borderTop: "1.5px dashed #ff9800" }}></span> Entry Price
             </div>
           )}
           <div className="flex items-center gap-1.5">
-            <span className="w-3 h-0.5 bg-[#6366f1] inline-block dashed" style={{ borderTop: "1.5px dashed #6366f1" }}></span> Fast EMA ({fastPeriod})
+            <span className="w-3 h-0.5 bg-[#2962ff] inline-block"></span> Fast EMA ({fastPeriod})
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="w-3 h-0.5 bg-[#f59e0b] inline-block"></span> Slow EMA ({slowPeriod})
+            <span className="w-3 h-0.5 bg-[#ff9800] inline-block"></span> Slow EMA ({slowPeriod})
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 bg-emerald-500/30 border border-emerald-500 rounded-sm inline-block"></span> Bullish Candle
+            <span className="w-2.5 h-2.5 bg-[#089981] rounded-sm inline-block"></span> Bullish Candle
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="w-2.5 h-2.5 bg-rose-500/30 border border-rose-500 rounded-sm inline-block"></span> Bearish Candle
+            <span className="w-2.5 h-2.5 bg-[#f23645] rounded-sm inline-block"></span> Bearish Candle
           </div>
         </div>
       </div>
@@ -543,8 +722,7 @@ export default function Home() {
   };
 
   return (
-    <div className="flex-1 bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-emerald-500 selection:text-slate-950">
-      {/* Glow effect backgrounds */}
+    <div className="flex-1 bg-[#090d16] text-slate-100 flex flex-col font-sans selection:bg-emerald-500 selection:text-slate-950 relative overflow-hidden">
       <div className="absolute top-0 left-1/4 w-[500px] h-[500px] bg-emerald-500/5 rounded-full blur-[120px] pointer-events-none" />
       <div className="absolute top-1/3 right-10 w-[400px] h-[400px] bg-indigo-500/5 rounded-full blur-[100px] pointer-events-none" />
 
@@ -622,7 +800,8 @@ export default function Home() {
         {/* Left column - Workspace (Candlestick chart, manual execution, positions, history) */}
         <div className="xl:col-span-3 flex flex-col gap-6">
           {/* KPIs Bar */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            {/* Balance */}
             <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between">
               <div>
                 <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Account Balance</p>
@@ -635,6 +814,7 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Equity */}
             <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between">
               <div>
                 <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Account Equity</p>
@@ -647,6 +827,7 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Active Position */}
             <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between">
               <div>
                 <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Active Position</p>
@@ -665,6 +846,7 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Bot Environment */}
             <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between">
               <div>
                 <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Bot Environment</p>
@@ -677,6 +859,53 @@ export default function Home() {
                 <Sliders className="w-5 h-5" />
               </div>
             </div>
+
+            {/* Win Rate Card */}
+            {(() => {
+              const rate = winStats.win_rate;
+              const isGood = rate >= 50;
+              const ringColor = rate === 0 ? "#334155" : isGood ? "#10b981" : "#f59e0b";
+              const textColor = rate === 0 ? "text-slate-500" : isGood ? "text-emerald-400" : "text-amber-400";
+              // SVG ring: r=18, circumference≈113.1
+              const circum = 113.1;
+              const dash = (rate / 100) * circum;
+              return (
+                <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Win Rate</p>
+                    <h3 className={`text-xl font-black mt-1 font-mono ${textColor}`}>
+                      {rate > 0 ? `${rate.toFixed(1)}%` : "—"}
+                    </h3>
+                    <div className="flex gap-3 mt-1.5 text-[9px] font-mono text-slate-500">
+                      <span className="text-emerald-500">{winStats.wins}W</span>
+                      <span className="text-rose-400">{winStats.losses}L</span>
+                      <span className={winStats.total_pnl >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                        {winStats.total_pnl >= 0 ? "+" : ""}{winStats.total_pnl.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                  {/* Ring chart */}
+                  <svg width="44" height="44" viewBox="0 0 44 44" className="shrink-0">
+                    <circle cx="22" cy="22" r="18" fill="none" stroke="#1e293b" strokeWidth="4" />
+                    {rate > 0 && (
+                      <circle
+                        cx="22" cy="22" r="18"
+                        fill="none"
+                        stroke={ringColor}
+                        strokeWidth="4"
+                        strokeLinecap="round"
+                        strokeDasharray={`${dash} ${circum}`}
+                        strokeDashoffset={circum / 4}
+                        style={{ filter: `drop-shadow(0 0 4px ${ringColor})` }}
+                      />
+                    )}
+                    <text x="22" y="26" textAnchor="middle" fill={rate === 0 ? "#475569" : ringColor} fontSize="9" fontWeight="bold" fontFamily="monospace">
+                      {winStats.total_trades > 0 ? `${winStats.total_trades}T` : "0T"}
+                    </text>
+                  </svg>
+                </div>
+              );
+            })()}
           </div>
 
           {/* SVG Candlestick Chart */}

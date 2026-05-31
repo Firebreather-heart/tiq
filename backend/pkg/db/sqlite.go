@@ -290,3 +290,41 @@ func (db *DB) GetLogs(limit int) ([]SystemLog, error) {
 	}
 	return list, nil
 }
+
+// WinRateStats holds aggregated performance statistics for closed positions.
+type WinRateStats struct {
+	TotalTrades  int     `json:"total_trades"`
+	Wins         int     `json:"wins"`
+	Losses       int     `json:"losses"`
+	WinRate      float64 `json:"win_rate"`       // 0–100
+	TotalPnL     float64 `json:"total_pnl"`
+	AvgWin       float64 `json:"avg_win"`
+	AvgLoss      float64 `json:"avg_loss"`
+}
+
+// GetWinRate computes win/loss statistics from all closed positions.
+func (db *DB) GetWinRate() (WinRateStats, error) {
+	query := `
+		SELECT
+			COUNT(*) AS total,
+			SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+			SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END) AS losses,
+			COALESCE(SUM(realized_pnl), 0) AS total_pnl,
+			COALESCE(AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END), 0) AS avg_win,
+			COALESCE(AVG(CASE WHEN realized_pnl <= 0 THEN realized_pnl END), 0) AS avg_loss
+		FROM positions
+		WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL;`
+
+	var s WinRateStats
+	err := db.conn.QueryRow(query).Scan(
+		&s.TotalTrades, &s.Wins, &s.Losses,
+		&s.TotalPnL, &s.AvgWin, &s.AvgLoss,
+	)
+	if err != nil {
+		return s, err
+	}
+	if s.TotalTrades > 0 {
+		s.WinRate = float64(s.Wins) / float64(s.TotalTrades) * 100
+	}
+	return s, nil
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -195,12 +196,30 @@ func (r *Runner) Tick() error {
 
 	if activePos != nil {
 		// We have an active position.
-		// If the new signal is opposite, close the position
 		isLong := activePos.Units > 0
-		if (isLong && signal == "SELL") || (!isLong && signal == "BUY") {
-			r.store.Log("INFO", fmt.Sprintf("Opposite signal received. Closing active position %s.", activePos.ID))
+
+		// Exit Condition 1: Opposite signal — full trend reversal.
+		oppositeSignal := (isLong && signal == "SELL") || (!isLong && signal == "BUY")
+
+		// Exit Condition 2: Trend fade — EMA spread has collapsed to near-zero
+		// even before a full crossover. This exits weakening momentum early.
+		emaSpread := latestFastEMA - latestSlowEMA
+		emaSpreading := (isLong && emaSpread > 0) || (!isLong && emaSpread < 0)
+		emaTrendFading := !emaSpreading // spread has flipped direction
+
+		// Exit Condition 3: RSI extreme — overbought on a long, oversold on a short
+		rsiOverextended := (isLong && latestRSI > 75) || (!isLong && latestRSI < 25)
+
+		if oppositeSignal || emaTrendFading || rsiOverextended {
+			reason := "opposite signal"
+			if emaTrendFading {
+				reason = "EMA trend fade (spread collapsed)"
+			} else if rsiOverextended {
+				reason = fmt.Sprintf("RSI overextended (%.1f)", latestRSI)
+			}
+			r.store.Log("INFO", fmt.Sprintf("Early exit triggered [%s]. Closing position %s @ %.5f", reason, activePos.ID, currentPrice))
 			if err := r.engine.ClosePosition(activePos.ID, currentPrice); err != nil {
-				return fmt.Errorf("failed to close position: %w", err)
+				return fmt.Errorf("failed to close position on early exit: %w", err)
 			}
 			activePos = nil // Closed
 		}
@@ -360,18 +379,32 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	instUpper := strings.ToUpper(instrument)
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 
-	// Try fetching live Binance candles for crypto pairs since crypto markets are 24/7/365
+	// Try fetching live crypto candles from CoinGecko first, falling back to Coinbase, Kraken, and finally Binance
 	if isCrypto {
-		candles, err = fetchBinanceCandles(instrument, count)
+		candles, err = fetchCoinGeckoCandles(instrument, count)
 		if err != nil {
-			r.store.Log("WARN", fmt.Sprintf("Failed to fetch Binance candles for %s: %v. Falling back to default provider.", instrument, err))
-		} else if len(candles) > 0 {
+			r.store.Log("WARN", fmt.Sprintf("Failed to fetch CoinGecko candles for %s: %v. Trying Coinbase backup...", instrument, err))
+			candles, err = fetchCoinbaseCandles(instrument, count)
+			if err != nil {
+				r.store.Log("WARN", fmt.Sprintf("Failed to fetch Coinbase candles for %s: %v. Trying Kraken backup...", instrument, err))
+				candles, err = fetchKrakenCandles(instrument, count)
+				if err != nil {
+					r.store.Log("WARN", fmt.Sprintf("Failed to fetch Kraken candles for %s: %v. Trying Binance backup...", instrument, err))
+					candles, err = fetchBinanceCandles(instrument, count)
+					if err != nil {
+						r.store.Log("WARN", fmt.Sprintf("Failed to fetch Binance candles for %s: %v. Falling back to default provider.", instrument, err))
+					}
+				}
+			}
+		}
+
+		if len(candles) > 0 {
 			// Initialize or update simulator base price with the real live crypto close price
 			r.engine.UpdatePrices(map[string]float64{instrument: candles[len(candles)-1].Close})
 		}
 	}
 
-	// Fallback to Oanda or dummy generator if Binance failed, wasn't applicable, or returned no data
+	// Fallback to Oanda or dummy generator if live crypto feeds failed, weren't applicable, or returned no data
 	if len(candles) == 0 {
 		if r.oandaClient == nil {
 			// Return dummy candles for mockup/testing if no key is configured
@@ -436,6 +469,58 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	return candles, nil
 }
 
+// fetchCoinbaseCandles retrieves 24/7 spot crypto market candles from Coinbase's public Exchange REST API
+func fetchCoinbaseCandles(symbol string, count int) ([]oanda.Candle, error) {
+	// Map instrument (e.g. BTC_USD -> BTC-USD)
+	coinbaseSymbol := strings.ReplaceAll(symbol, "_", "-")
+
+	url := fmt.Sprintf("https://api.exchange.coinbase.com/products/%s/candles?granularity=300&limit=%d", coinbaseSymbol, count)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Coinbase Exchange API requires a User-Agent header to prevent 403 Forbidden
+	req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("coinbase api returned status code %d", resp.StatusCode)
+	}
+
+	var rawCandles [][]float64
+	if err := json.NewDecoder(resp.Body).Decode(&rawCandles); err != nil {
+		return nil, err
+	}
+
+	var candles []oanda.Candle
+	// Coinbase returns candles in reverse chronological order (latest first), so parse backwards
+	for i := len(rawCandles) - 1; i >= 0; i-- {
+		item := rawCandles[i]
+		if len(item) < 6 {
+			continue
+		}
+
+		t := time.Unix(int64(item[0]), 0)
+		candles = append(candles, oanda.Candle{
+			Time:   t,
+			Volume: int(item[5]),
+			Open:   item[3],
+			High:   item[2],
+			Low:    item[1],
+			Close:  item[4],
+		})
+	}
+
+	return candles, nil
+}
+
 // fetchBinanceCandles retrieves 24/7 spot crypto market candles from Binance's public REST API
 func fetchBinanceCandles(symbol string, count int) ([]oanda.Candle, error) {
 	// Map instrument to Binance format (e.g. BTC_USD -> BTCUSDT)
@@ -495,6 +580,177 @@ func fetchBinanceCandles(symbol string, count int) ([]oanda.Candle, error) {
 			High:   highVal,
 			Low:    lowVal,
 			Close:  closeVal,
+		})
+	}
+
+	return candles, nil
+}
+
+// fetchKrakenCandles retrieves 24/7 spot crypto market candles from Kraken's public REST API
+func fetchKrakenCandles(symbol string, count int) ([]oanda.Candle, error) {
+	inst := strings.ToUpper(symbol)
+	var pair string
+	if strings.Contains(inst, "BTC") {
+		pair = "XBTUSD"
+	} else if strings.Contains(inst, "ETH") {
+		pair = "ETHUSD"
+	} else {
+		pair = strings.ReplaceAll(inst, "_", "")
+	}
+
+	url := fmt.Sprintf("https://api.kraken.com/0/public/OHLC?pair=%s&interval=5", pair)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("kraken api returned status code %d", resp.StatusCode)
+	}
+
+	var rawResponse struct {
+		Error  []string               `json:"error"`
+		Result map[string]interface{} `json:"result"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawResponse); err != nil {
+		return nil, err
+	}
+
+	if len(rawResponse.Error) > 0 {
+		return nil, fmt.Errorf("kraken api error: %s", strings.Join(rawResponse.Error, ", "))
+	}
+
+	var rawCandles []interface{}
+	for k, v := range rawResponse.Result {
+		if k == "last" {
+			continue
+		}
+		if arr, ok := v.([]interface{}); ok {
+			rawCandles = arr
+			break
+		}
+	}
+
+	if len(rawCandles) == 0 {
+		return nil, fmt.Errorf("no candle data found in kraken response")
+	}
+
+	startIdx := 0
+	if len(rawCandles) > count {
+		startIdx = len(rawCandles) - count
+	}
+
+	var candles []oanda.Candle
+	for i := startIdx; i < len(rawCandles); i++ {
+		candleArr, ok := rawCandles[i].([]interface{})
+		if !ok || len(candleArr) < 8 {
+			continue
+		}
+
+		tVal, ok1 := candleArr[0].(float64)
+		oVal, ok2 := candleArr[1].(string)
+		hVal, ok3 := candleArr[2].(string)
+		lVal, ok4 := candleArr[3].(string)
+		cVal, ok5 := candleArr[4].(string)
+		vVal, ok6 := candleArr[6].(string)
+
+		if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 {
+			continue
+		}
+
+		t := time.Unix(int64(tVal), 0)
+		o, errO := strconv.ParseFloat(oVal, 64)
+		h, errH := strconv.ParseFloat(hVal, 64)
+		l, errL := strconv.ParseFloat(lVal, 64)
+		c, errC := strconv.ParseFloat(cVal, 64)
+		vFloat, errV := strconv.ParseFloat(vVal, 64)
+
+		if errO != nil || errH != nil || errL != nil || errC != nil || errV != nil {
+			continue
+		}
+
+		candles = append(candles, oanda.Candle{
+			Time:   t,
+			Volume: int(vFloat),
+			Open:   o,
+			High:   h,
+			Low:    l,
+			Close:  c,
+		})
+	}
+
+	return candles, nil
+}
+
+// fetchCoinGeckoCandles retrieves 24/7 spot crypto market candles from CoinGecko's public REST API
+func fetchCoinGeckoCandles(symbol string, count int) ([]oanda.Candle, error) {
+	inst := strings.ToUpper(symbol)
+	var coinID string
+	if strings.Contains(inst, "BTC") {
+		coinID = "bitcoin"
+	} else if strings.Contains(inst, "ETH") {
+		coinID = "ethereum"
+	} else {
+		return nil, fmt.Errorf("unsupported coingecko instrument: %s", symbol)
+	}
+
+	apiKey := os.Getenv("COIN_GECKO_KEY")
+	url := fmt.Sprintf("https://api.coingecko.com/api/v3/coins/%s/ohlc?vs_currency=usd&days=1", coinID)
+	if apiKey != "" {
+		url = fmt.Sprintf("https://api.coingecko.com/api/v3/coins/%s/ohlc?vs_currency=usd&days=1&x_cg_demo_api_key=%s", coinID, apiKey)
+	}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("coingecko api returned status code %d", resp.StatusCode)
+	}
+
+	var rawCandles [][]float64
+	if err := json.NewDecoder(resp.Body).Decode(&rawCandles); err != nil {
+		return nil, err
+	}
+
+	startIdx := 0
+	if len(rawCandles) > count {
+		startIdx = len(rawCandles) - count
+	}
+
+	var candles []oanda.Candle
+	for i := startIdx; i < len(rawCandles); i++ {
+		item := rawCandles[i]
+		if len(item) < 5 {
+			continue
+		}
+		t := time.Unix(int64(item[0])/1000, 0)
+		candles = append(candles, oanda.Candle{
+			Time:   t,
+			Volume: 100, // CoinGecko OHLC does not provide volume, use dummy
+			Open:   item[1],
+			High:   item[2],
+			Low:    item[3],
+			Close:  item[4],
 		})
 	}
 

@@ -39,6 +39,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
 	mux.HandleFunc("GET /api/inferences", s.handleInferences)
 	mux.HandleFunc("GET /api/candles", s.handleCandles)
+	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/trade/manual", s.handleManualTrade)
 	mux.HandleFunc("POST /api/trade/close", s.handleClosePosition)
 
@@ -237,3 +238,11 @@ func (s *Server) handleCandles(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, candles)
 }
 
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.store.GetWinRate()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to fetch stats: %v", err))
+		return
+	}
+	s.writeJSON(w, http.StatusOK, stats)
+}
