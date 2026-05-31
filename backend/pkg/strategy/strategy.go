@@ -1,8 +1,11 @@
 package strategy
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,8 +67,8 @@ func (r *Runner) Tick() error {
 
 	r.store.Log("INFO", fmt.Sprintf("Strategy Tick started for %s...", r.cfg.Instrument))
 
-	// 1. Fetch candles from Oanda
-	candles, err := r.oandaClient.GetCandles(r.cfg.Instrument, 100, r.cfg.Granularity)
+	// 1. Fetch candles from unified provider (with Oanda/Binance fallback)
+	candles, err := r.GetCandles(r.cfg.Instrument, 100)
 	if err != nil {
 		return fmt.Errorf("failed to fetch candles: %w", err)
 	}
@@ -354,51 +357,65 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	var candles []oanda.Candle
 	var err error
 
-	if r.oandaClient == nil {
-		// Return dummy candles for mockup/testing if no key is configured
-		now := time.Now()
-		basePrice := 1.0850
-		instUpper := strings.ToUpper(instrument)
-		if strings.Contains(instUpper, "BTC") {
-			basePrice = 73500.00
-		} else if strings.Contains(instUpper, "ETH") {
-			basePrice = 3500.00
-		} else if strings.Contains(instUpper, "GBP") {
-			basePrice = 1.2700
-		}
+	instUpper := strings.ToUpper(instrument)
+	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 
-		for i := 0; i < count; i++ {
-			t := now.Add(time.Duration(-count+i) * 5 * time.Minute)
-			var change float64
-			if basePrice > 1000 {
-				change = (math.Sin(float64(i)*0.1) * 100.0) + (math.Cos(float64(i)*0.05) * 50.0)
-			} else {
-				change = (math.Sin(float64(i)*0.1) * 0.001) + (math.Cos(float64(i)*0.05) * 0.0005)
-			}
-			closeP := basePrice + change
-			var openP, highP, lowP float64
-			if basePrice > 1000 {
-				openP = closeP - (math.Sin(float64(i)) * 40.0)
-				highP = math.Max(openP, closeP) + 30.0
-				lowP = math.Min(openP, closeP) - 30.0
-			} else {
-				openP = closeP - (math.Sin(float64(i)) * 0.0004)
-				highP = math.Max(openP, closeP) + 0.0003
-				lowP = math.Min(openP, closeP) - 0.0003
-			}
-			candles = append(candles, oanda.Candle{
-				Time:   t,
-				Volume: 100 + (i % 50),
-				Open:   openP,
-				High:   highP,
-				Low:    lowP,
-				Close:  closeP,
-			})
+	// Try fetching live Binance candles for crypto pairs since crypto markets are 24/7/365
+	if isCrypto {
+		candles, err = fetchBinanceCandles(instrument, count)
+		if err == nil && len(candles) > 0 {
+			// Initialize or update simulator base price with the real live crypto close price
+			r.engine.UpdatePrices(map[string]float64{instrument: candles[len(candles)-1].Close})
 		}
-	} else {
-		candles, err = r.oandaClient.GetCandles(instrument, count, r.cfg.Granularity)
-		if err != nil {
-			return nil, err
+	}
+
+	// Fallback to Oanda or dummy generator if Binance failed, wasn't applicable, or returned no data
+	if len(candles) == 0 {
+		if r.oandaClient == nil {
+			// Return dummy candles for mockup/testing if no key is configured
+			now := time.Now()
+			basePrice := 1.0850
+			if strings.Contains(instUpper, "BTC") {
+				basePrice = 73500.00
+			} else if strings.Contains(instUpper, "ETH") {
+				basePrice = 3500.00
+			} else if strings.Contains(instUpper, "GBP") {
+				basePrice = 1.2700
+			}
+
+			for i := 0; i < count; i++ {
+				t := now.Add(time.Duration(-count+i) * 5 * time.Minute)
+				var change float64
+				if basePrice > 1000 {
+					change = (math.Sin(float64(i)*0.1) * 100.0) + (math.Cos(float64(i)*0.05) * 50.0)
+				} else {
+					change = (math.Sin(float64(i)*0.1) * 0.001) + (math.Cos(float64(i)*0.05) * 0.0005)
+				}
+				closeP := basePrice + change
+				var openP, highP, lowP float64
+				if basePrice > 1000 {
+					openP = closeP - (math.Sin(float64(i)) * 40.0)
+					highP = math.Max(openP, closeP) + 30.0
+					lowP = math.Min(openP, closeP) - 30.0
+				} else {
+					openP = closeP - (math.Sin(float64(i)) * 0.0004)
+					highP = math.Max(openP, closeP) + 0.0003
+					lowP = math.Min(openP, closeP) - 0.0003
+				}
+				candles = append(candles, oanda.Candle{
+					Time:   t,
+					Volume: 100 + (i % 50),
+					Open:   openP,
+					High:   highP,
+					Low:    lowP,
+					Close:  closeP,
+				})
+			}
+		} else {
+			candles, err = r.oandaClient.GetCandles(instrument, count, r.cfg.Granularity)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -412,6 +429,71 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 		if price < candles[lastIdx].Low {
 			candles[lastIdx].Low = price
 		}
+	}
+
+	return candles, nil
+}
+
+// fetchBinanceCandles retrieves 24/7 spot crypto market candles from Binance's public REST API
+func fetchBinanceCandles(symbol string, count int) ([]oanda.Candle, error) {
+	// Map instrument to Binance format (e.g. BTC_USD -> BTCUSDT)
+	binanceSymbol := strings.ReplaceAll(symbol, "_", "")
+	if binanceSymbol == "BTCUSD" {
+		binanceSymbol = "BTCUSDT"
+	} else if binanceSymbol == "ETHUSD" {
+		binanceSymbol = "ETHUSDT"
+	}
+
+	url := fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%s&interval=5m&limit=%d", binanceSymbol, count)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("binance api returned status code %d", resp.StatusCode)
+	}
+
+	var rawKlines [][]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&rawKlines); err != nil {
+		return nil, err
+	}
+
+	var candles []oanda.Candle
+	for _, kline := range rawKlines {
+		if len(kline) < 6 {
+			continue
+		}
+
+		openTimeMs, ok := kline[0].(float64)
+		if !ok {
+			continue
+		}
+		t := time.Unix(0, int64(openTimeMs)*int64(time.Millisecond))
+
+		openStr, _ := kline[1].(string)
+		highStr, _ := kline[2].(string)
+		lowStr, _ := kline[3].(string)
+		closeStr, _ := kline[4].(string)
+		volumeStr, _ := kline[5].(string)
+
+		openVal, _ := strconv.ParseFloat(openStr, 64)
+		highVal, _ := strconv.ParseFloat(highStr, 64)
+		lowVal, _ := strconv.ParseFloat(lowStr, 64)
+		closeVal, _ := strconv.ParseFloat(closeStr, 64)
+		volumeVal, _ := strconv.ParseFloat(volumeStr, 64)
+
+		candles = append(candles, oanda.Candle{
+			Time:   t,
+			Volume: int(volumeVal),
+			Open:   openVal,
+			High:   highVal,
+			Low:    lowVal,
+			Close:  closeVal,
+		})
 	}
 
 	return candles, nil
