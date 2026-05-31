@@ -363,7 +363,9 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	// Try fetching live Binance candles for crypto pairs since crypto markets are 24/7/365
 	if isCrypto {
 		candles, err = fetchBinanceCandles(instrument, count)
-		if err == nil && len(candles) > 0 {
+		if err != nil {
+			r.store.Log("WARN", fmt.Sprintf("Failed to fetch Binance candles for %s: %v. Falling back to default provider.", instrument, err))
+		} else if len(candles) > 0 {
 			// Initialize or update simulator base price with the real live crypto close price
 			r.engine.UpdatePrices(map[string]float64{instrument: candles[len(candles)-1].Close})
 		}

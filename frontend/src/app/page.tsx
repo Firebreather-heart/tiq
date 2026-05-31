@@ -431,11 +431,102 @@ export default function Home() {
               strokeWidth="1.5"
             />
           )}
+
+          {/* Current Price Line */}
+          {(() => {
+            const currentPrice = candles[candles.length - 1].close;
+            const decimals = currentPrice > 1000 ? 2 : 5;
+            const yCurrent = yMap(currentPrice);
+            if (yCurrent >= paddingTop && yCurrent <= height - paddingBottom) {
+              return (
+                <g>
+                  <line
+                    x1={paddingLeft}
+                    y1={yCurrent}
+                    x2={width - paddingRight}
+                    y2={yCurrent}
+                    stroke="#06b6d4"
+                    strokeWidth="1.5"
+                    strokeDasharray="2,2"
+                  />
+                  <rect
+                    x={width - paddingRight + 2}
+                    y={yCurrent - 7}
+                    width={52}
+                    height={14}
+                    fill="#020617"
+                    stroke="#06b6d4"
+                    strokeWidth="1"
+                    rx="3"
+                  />
+                  <text
+                    x={width - paddingRight + 6}
+                    y={yCurrent + 3}
+                    fill="#06b6d4"
+                    className="text-[9px] font-mono font-bold"
+                  >
+                    {currentPrice.toFixed(decimals)}
+                  </text>
+                </g>
+              );
+            }
+            return null;
+          })()}
+
+          {/* Entry Price Line */}
+          {positions.length > 0 && (() => {
+            const currentPrice = candles[candles.length - 1].close;
+            const decimals = currentPrice > 1000 ? 2 : 5;
+            const entryPrice = positions[0].open_price;
+            const yEntry = yMap(entryPrice);
+            if (yEntry >= paddingTop && yEntry <= height - paddingBottom) {
+              return (
+                <g>
+                  <line
+                    x1={paddingLeft}
+                    y1={yEntry}
+                    x2={width - paddingRight}
+                    y2={yEntry}
+                    stroke="#a855f7"
+                    strokeWidth="1.5"
+                    strokeDasharray="4,4"
+                  />
+                  <rect
+                    x={width - paddingRight + 2}
+                    y={yEntry - 7}
+                    width={52}
+                    height={14}
+                    fill="#020617"
+                    stroke="#a855f7"
+                    strokeWidth="1"
+                    rx="3"
+                  />
+                  <text
+                    x={width - paddingRight + 6}
+                    y={yEntry + 3}
+                    fill="#a855f7"
+                    className="text-[9px] font-mono font-bold"
+                  >
+                    {entryPrice.toFixed(decimals)}
+                  </text>
+                </g>
+              );
+            }
+            return null;
+          })()}
         </svg>
 
         <div className="flex items-center gap-4 mt-2 justify-end text-[10px] text-slate-400 font-mono">
           <div className="flex items-center gap-1.5">
-            <span className="w-3 h-0.5 bg-[#6366f1] inline-block dashed"></span> Fast EMA ({fastPeriod})
+            <span className="w-3 h-0.5 bg-[#06b6d4] inline-block dashed" style={{ borderTop: "1.5px dashed #06b6d4" }}></span> Live Price
+          </div>
+          {positions.length > 0 && (
+            <div className="flex items-center gap-1.5">
+              <span className="w-3 h-0.5 bg-[#a855f7] inline-block dashed" style={{ borderTop: "1.5px dashed #a855f7" }}></span> Entry Price
+            </div>
+          )}
+          <div className="flex items-center gap-1.5">
+            <span className="w-3 h-0.5 bg-[#6366f1] inline-block dashed" style={{ borderTop: "1.5px dashed #6366f1" }}></span> Fast EMA ({fastPeriod})
           </div>
           <div className="flex items-center gap-1.5">
             <span className="w-3 h-0.5 bg-[#f59e0b] inline-block"></span> Slow EMA ({slowPeriod})
