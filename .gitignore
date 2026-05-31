@@ -30,3 +30,14 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+.cursor/
+.cursorrules
+
+# Compiled Binaries
+trading_bot
+
+# SQLite DB files
+*.db
+*.db-shm
+*.db-wal
+
