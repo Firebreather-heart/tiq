@@ -35,7 +35,7 @@ func main() {
 		dbPath = "trading_bot.db"
 	}
 	if instrument == "" {
-		instrument = "EUR_USD"
+		instrument = "BTC_USD"
 	}
 	topicID := 1
 	if alloraTopic != "" {
@@ -144,6 +144,19 @@ func main() {
 		for range ticker.C {
 			if err := runner.Tick(); err != nil {
 				store.Log("ERROR", fmt.Sprintf("Tick execution failed: %v", err))
+			}
+		}
+	}()
+
+	// 6.5. Start Live Price Ticker in Background
+	go func() {
+		store.Log("INFO", "Background live price ticker started.")
+		liveTicker := time.NewTicker(2 * time.Second)
+		defer liveTicker.Stop()
+
+		for range liveTicker.C {
+			if err := runner.LiveTick(); err != nil {
+				// Silently handle to prevent spamming logs
 			}
 		}
 	}()

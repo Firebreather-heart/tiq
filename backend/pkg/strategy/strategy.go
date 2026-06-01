@@ -82,12 +82,14 @@ func (r *Runner) Tick() error {
 	latestCandle := candles[len(candles)-1]
 	currentPrice := latestCandle.Close
 
-	// Update simulator prices
-	prices := map[string]float64{
-		r.cfg.Instrument: currentPrice,
-	}
-	if err := r.engine.UpdatePrices(prices); err != nil {
-		r.store.Log("WARN", fmt.Sprintf("Failed to update simulator prices: %v", err))
+	// Update simulator prices only if they don't exist yet (to avoid overwriting fresh live prices with stale candle close)
+	if _, exists := r.engine.GetPrice(r.cfg.Instrument); !exists {
+		prices := map[string]float64{
+			r.cfg.Instrument: currentPrice,
+		}
+		if err := r.engine.UpdatePrices(prices); err != nil {
+			r.store.Log("WARN", fmt.Sprintf("Failed to update simulator prices: %v", err))
+		}
 	}
 
 	// 3. Compute Technical Indicators
@@ -379,23 +381,11 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	instUpper := strings.ToUpper(instrument)
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 
-	// Try fetching live crypto candles from CoinGecko first, falling back to Coinbase, Kraken, and finally Binance
+	// Fetch live crypto candles from Kraken (routed via proxy)
 	if isCrypto {
-		candles, err = fetchCoinGeckoCandles(instrument, count)
+		candles, err = fetchKrakenCandles(instrument, count)
 		if err != nil {
-			r.store.Log("WARN", fmt.Sprintf("Failed to fetch CoinGecko candles for %s: %v. Trying Coinbase backup...", instrument, err))
-			candles, err = fetchCoinbaseCandles(instrument, count)
-			if err != nil {
-				r.store.Log("WARN", fmt.Sprintf("Failed to fetch Coinbase candles for %s: %v. Trying Kraken backup...", instrument, err))
-				candles, err = fetchKrakenCandles(instrument, count)
-				if err != nil {
-					r.store.Log("WARN", fmt.Sprintf("Failed to fetch Kraken candles for %s: %v. Trying Binance backup...", instrument, err))
-					candles, err = fetchBinanceCandles(instrument, count)
-					if err != nil {
-						r.store.Log("WARN", fmt.Sprintf("Failed to fetch Binance candles for %s: %v. Falling back to default provider.", instrument, err))
-					}
-				}
-			}
+			r.store.Log("WARN", fmt.Sprintf("Failed to fetch Kraken candles for %s: %v. Falling back to default provider.", instrument, err))
 		}
 
 		if len(candles) > 0 {
@@ -404,48 +394,10 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 		}
 	}
 
-	// Fallback to Oanda or dummy generator if live crypto feeds failed, weren't applicable, or returned no data
+	// If no live candles were fetched and we don't have an OANDA client fallback, return a catastrophic system error
 	if len(candles) == 0 {
 		if r.oandaClient == nil {
-			// Return dummy candles for mockup/testing if no key is configured
-			now := time.Now()
-			basePrice := 1.0850
-			if strings.Contains(instUpper, "BTC") {
-				basePrice = 73500.00
-			} else if strings.Contains(instUpper, "ETH") {
-				basePrice = 3500.00
-			} else if strings.Contains(instUpper, "GBP") {
-				basePrice = 1.2700
-			}
-
-			for i := 0; i < count; i++ {
-				t := now.Add(time.Duration(-count+i) * 5 * time.Minute)
-				var change float64
-				if basePrice > 1000 {
-					change = (math.Sin(float64(i)*0.1) * 100.0) + (math.Cos(float64(i)*0.05) * 50.0)
-				} else {
-					change = (math.Sin(float64(i)*0.1) * 0.001) + (math.Cos(float64(i)*0.05) * 0.0005)
-				}
-				closeP := basePrice + change
-				var openP, highP, lowP float64
-				if basePrice > 1000 {
-					openP = closeP - (math.Sin(float64(i)) * 40.0)
-					highP = math.Max(openP, closeP) + 30.0
-					lowP = math.Min(openP, closeP) - 30.0
-				} else {
-					openP = closeP - (math.Sin(float64(i)) * 0.0004)
-					highP = math.Max(openP, closeP) + 0.0003
-					lowP = math.Min(openP, closeP) - 0.0003
-				}
-				candles = append(candles, oanda.Candle{
-					Time:   t,
-					Volume: 100 + (i % 50),
-					Open:   openP,
-					High:   highP,
-					Low:    lowP,
-					Close:  closeP,
-				})
-			}
+			return nil, fmt.Errorf("catastrophic failure: failed to fetch live crypto candles and no broker fallback is configured")
 		} else {
 			candles, err = r.oandaClient.GetCandles(instrument, count, r.cfg.Granularity)
 			if err != nil {
@@ -469,57 +421,7 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	return candles, nil
 }
 
-// fetchCoinbaseCandles retrieves 24/7 spot crypto market candles from Coinbase's public Exchange REST API
-func fetchCoinbaseCandles(symbol string, count int) ([]oanda.Candle, error) {
-	// Map instrument (e.g. BTC_USD -> BTC-USD)
-	coinbaseSymbol := strings.ReplaceAll(symbol, "_", "-")
 
-	url := fmt.Sprintf("https://api.exchange.coinbase.com/products/%s/candles?granularity=300&limit=%d", coinbaseSymbol, count)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	// Coinbase Exchange API requires a User-Agent header to prevent 403 Forbidden
-	req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("coinbase api returned status code %d", resp.StatusCode)
-	}
-
-	var rawCandles [][]float64
-	if err := json.NewDecoder(resp.Body).Decode(&rawCandles); err != nil {
-		return nil, err
-	}
-
-	var candles []oanda.Candle
-	// Coinbase returns candles in reverse chronological order (latest first), so parse backwards
-	for i := len(rawCandles) - 1; i >= 0; i-- {
-		item := rawCandles[i]
-		if len(item) < 6 {
-			continue
-		}
-
-		t := time.Unix(int64(item[0]), 0)
-		candles = append(candles, oanda.Candle{
-			Time:   t,
-			Volume: int(item[5]),
-			Open:   item[3],
-			High:   item[2],
-			Low:    item[1],
-			Close:  item[4],
-		})
-	}
-
-	return candles, nil
-}
 
 // fetchBinanceCandles retrieves 24/7 spot crypto market candles from Binance's public REST API
 func fetchBinanceCandles(symbol string, count int) ([]oanda.Candle, error) {
@@ -598,7 +500,13 @@ func fetchKrakenCandles(symbol string, count int) ([]oanda.Candle, error) {
 		pair = strings.ReplaceAll(inst, "_", "")
 	}
 
-	url := fmt.Sprintf("https://api.kraken.com/0/public/OHLC?pair=%s&interval=5", pair)
+	proxyURL := os.Getenv("PROXY_URL")
+	var url string
+	if proxyURL != "" {
+		url = fmt.Sprintf("%s/proxy/kraken/0/public/OHLC?pair=%s&interval=5", proxyURL, pair)
+	} else {
+		url = fmt.Sprintf("https://api.kraken.com/0/public/OHLC?pair=%s&interval=5", pair)
+	}
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -606,7 +514,11 @@ func fetchKrakenCandles(symbol string, count int) ([]oanda.Candle, error) {
 	}
 	req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	clientTimeout := 5 * time.Second
+	if proxyURL != "" {
+		clientTimeout = 180 * time.Second // Allow extra time for Render free tier cold start/spin down (up to 180 seconds)
+	}
+	client := &http.Client{Timeout: clientTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -756,4 +668,129 @@ func fetchCoinGeckoCandles(symbol string, count int) ([]oanda.Candle, error) {
 
 	return candles, nil
 }
+
+// LiveTick fetches the real-time spot price frequently
+// to decouple live execution from the 5-minute candle evaluation.
+func (r *Runner) LiveTick() error {
+	if !r.cfg.TradingEnabled {
+		return nil
+	}
+	instUpper := strings.ToUpper(r.cfg.Instrument)
+	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
+	
+	if isCrypto {
+		livePrice, err := fetchLivePrice(r.cfg.Instrument)
+		if err == nil && livePrice > 0 {
+			r.engine.UpdatePrices(map[string]float64{r.cfg.Instrument: livePrice})
+		} else if err != nil {
+			return err
+		}
+	}
+	// For Oanda (forex), OandaBroker updates prices directly via websocket stream internally or simulator oscillator handles it.
+	return nil
+}
+
+// fetchLivePrice retrieves the sub-second live spot price from Coinbase (primary for crypto) or Bybit
+func fetchLivePrice(symbol string) (float64, error) {
+	instUpper := strings.ToUpper(symbol)
+	isBTC := strings.Contains(instUpper, "BTC")
+	isETH := strings.Contains(instUpper, "ETH")
+
+	if isBTC || isETH {
+		// Use Kraken API (routed via proxy) as the primary, ultra-reliable spot price feed
+		var pair string
+		if isBTC {
+			pair = "XBTUSD"
+		} else {
+			pair = "ETHUSD"
+		}
+
+		proxyURL := os.Getenv("PROXY_URL")
+		var url string
+		if proxyURL != "" {
+			url = fmt.Sprintf("%s/proxy/kraken/0/public/Ticker?pair=%s", proxyURL, pair)
+		} else {
+			url = fmt.Sprintf("https://api.kraken.com/0/public/Ticker?pair=%s", pair)
+		}
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err == nil {
+			req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
+			clientTimeout := 2 * time.Second
+			if proxyURL != "" {
+				clientTimeout = 180 * time.Second // Allow extra time for Render spin down (up to 180 seconds)
+			}
+			client := &http.Client{Timeout: clientTimeout}
+			resp, err := client.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var rawResponse struct {
+						Error  []string               `json:"error"`
+						Result map[string]interface{} `json:"result"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&rawResponse); err == nil && len(rawResponse.Error) == 0 {
+						// Kraken returns nested map, find the pair key (could be XXBTZUSD or XETHZUSD or symbol)
+						for k, v := range rawResponse.Result {
+							if k == "error" {
+								continue
+							}
+							if dataMap, ok := v.(map[string]interface{}); ok {
+								// "c" is last trade closed array, first element is price string
+								if cArr, ok := dataMap["c"].([]interface{}); ok && len(cArr) > 0 {
+									if priceStr, ok := cArr[0].(string); ok {
+										price, err := strconv.ParseFloat(priceStr, 64)
+										if err == nil && price > 0 {
+											return price, nil
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	bybitSymbol := strings.ReplaceAll(symbol, "_", "")
+	if bybitSymbol == "BTCUSD" {
+		bybitSymbol = "BTCUSDT"
+	}
+	proxyURL := os.Getenv("PROXY_URL")
+	var url string
+	if proxyURL != "" {
+		url = fmt.Sprintf("%s/proxy/bybit/v5/market/tickers?category=linear&symbol=%s", proxyURL, bybitSymbol)
+	} else {
+		url = fmt.Sprintf("https://api.bybit.com/v5/market/tickers?category=linear&symbol=%s", bybitSymbol)
+	}
+	clientTimeout := 2 * time.Second
+	if proxyURL != "" {
+		clientTimeout = 60 * time.Second // Allow extra time for Render free tier cold start/spin down
+	}
+	client := &http.Client{Timeout: clientTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	var rawResponse struct {
+		Result struct {
+			List []struct {
+				LastPrice string `json:"lastPrice"`
+			} `json:"list"`
+		} `json:"result"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawResponse); err != nil {
+		return 0, err
+	}
+
+	if len(rawResponse.Result.List) > 0 {
+		return strconv.ParseFloat(rawResponse.Result.List[0].LastPrice, 64)
+	}
+	return 0, fmt.Errorf("no live price found")
+}
+
 
