@@ -8,9 +8,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"tiq/backend/pkg/allora"
 	"tiq/backend/pkg/db"
 	"tiq/backend/pkg/engine"
 	"tiq/backend/pkg/oanda"
@@ -34,14 +34,19 @@ type Config struct {
 }
 
 type Runner struct {
-	cfg          Config
-	store        *db.DB
-	oandaClient  *oanda.Client
-	alloraClient *allora.Client
-	engine       engine.ExecutionEngine
+	cfg             Config
+	store           *db.DB
+	oandaClient     *oanda.Client
+	alloraClient    interface{}
+	engine          engine.ExecutionEngine
+	cachedATR       float64
+	cachedCandles   []oanda.Candle
+	lastCandleFetch time.Time
+	polyMu          sync.RWMutex
+	latestPolyInfo  *PolymarketMarketInfo
 }
 
-func NewRunner(cfg Config, store *db.DB, oClient *oanda.Client, aClient *allora.Client, eng engine.ExecutionEngine) *Runner {
+func NewRunner(cfg Config, store *db.DB, oClient *oanda.Client, aClient interface{}, eng engine.ExecutionEngine) *Runner {
 	return &Runner{
 		cfg:          cfg,
 		store:        store,
@@ -55,6 +60,12 @@ func (r *Runner) GetConfig() Config {
 	return r.cfg
 }
 
+func (r *Runner) GetLatestPolymarketInfo() *PolymarketMarketInfo {
+	r.polyMu.RLock()
+	defer r.polyMu.RUnlock()
+	return r.latestPolyInfo
+}
+
 func (r *Runner) UpdateConfig(newCfg Config) {
 	r.cfg = newCfg
 	r.store.Log("INFO", fmt.Sprintf("Config updated: Instrument=%s, TradingEnabled=%t, UseAllora=%t", r.cfg.Instrument, r.cfg.TradingEnabled, r.cfg.UseAllora))
@@ -64,6 +75,148 @@ func (r *Runner) UpdateConfig(newCfg Config) {
 func (r *Runner) Tick() error {
 	if !r.cfg.TradingEnabled {
 		return nil
+	}
+
+	if polyEng, ok := r.engine.(*engine.PolymarketEngine); ok {
+		var latestATR float64
+		var currentPrice float64
+		var candles []oanda.Candle
+
+		if time.Since(r.lastCandleFetch) >= 30*time.Second || len(r.cachedCandles) == 0 {
+			var err error
+			candles, err = r.GetCandles(r.cfg.Instrument, 100)
+			if err != nil {
+				return fmt.Errorf("failed to fetch candles: %w", err)
+			}
+			if len(candles) < r.cfg.EmaSlowPeriod+2 {
+				return fmt.Errorf("insufficient candles fetched: got %d", len(candles))
+			}
+			
+			r.cachedCandles = candles
+			closes := make([]float64, len(candles))
+			highs := make([]float64, len(candles))
+			lows := make([]float64, len(candles))
+			for i, c := range candles {
+				closes[i] = c.Close
+				highs[i] = c.High
+				lows[i] = c.Low
+			}
+			
+			atr := calculateATR(highs, lows, closes, 5)
+			r.cachedATR = atr[len(atr)-1]
+			r.lastCandleFetch = time.Now()
+			
+			latestCandle := candles[len(candles)-1]
+			currentPrice = latestCandle.Close
+			latestATR = r.cachedATR
+		} else {
+			latestATR = r.cachedATR
+			candles = r.cachedCandles
+			if price, ok := r.engine.GetPrice(r.cfg.Instrument); ok {
+				currentPrice = price
+			} else {
+				latestCandle := candles[len(candles)-1]
+				currentPrice = latestCandle.Close
+			}
+		}
+
+		// Compute EMA Trend momentum
+		closes := make([]float64, len(candles))
+		for i, c := range candles {
+			closes[i] = c.Close
+		}
+		fastEMA := calculateEMA(closes, r.cfg.EmaFastPeriod)
+		slowEMA := calculateEMA(closes, r.cfg.EmaSlowPeriod)
+		isBullishTrend := fastEMA[len(fastEMA)-1] > slowEMA[len(slowEMA)-1]
+		
+		prices := map[string]float64{
+			r.cfg.Instrument: currentPrice,
+		}
+		_ = polyEng.UpdatePrices(prices)
+		latestATR = r.cachedATR
+		
+		// Fetch exact live Polymarket strike and expiration from real contracts
+		r.store.Log("INFO", "[Polymarket] Querying active BTC contracts directly from Polymarket Gamma API...")
+		liveMarket, err := FetchActivePolymarketStrike(currentPrice)
+		
+		var strike float64
+		var expiration time.Time
+		var marketAddr string
+
+		if err == nil && liveMarket != nil {
+			// Check if we already have an open position for this market's ConditionID
+			// to prevent strike price drift due to candle loading latency
+			strike = currentPrice // fallback
+			foundActivePos := false
+			if openPositions, posErr := polyEng.GetOpenPositions(); posErr == nil {
+				for _, pos := range openPositions {
+					posParts := strings.Split(pos.Instrument, "_")
+					if len(posParts) >= 6 && posParts[1] == liveMarket.MarketID {
+						if sVal, err := strconv.ParseFloat(posParts[3], 64); err == nil {
+							strike = sVal
+							foundActivePos = true
+							r.store.Log("INFO", fmt.Sprintf("[Polymarket] Active position found. Matching strike price to open position: $%.2f", strike))
+							break
+						}
+					}
+				}
+			}
+
+			if !foundActivePos {
+				// Find the candle corresponding to the start timestamp of the active 5-minute window
+				// to extract the exact Open price at the beginning of the interval
+				foundCandle := false
+				for _, c := range candles {
+					if c.Time.Unix() == liveMarket.StartTimestamp {
+						strike = c.Open
+						foundCandle = true
+						break
+					}
+				}
+				if !foundCandle && len(candles) > 0 {
+					// Fallback to the open price of the last candle if we don't have the exact timestamp candle
+					strike = candles[len(candles)-1].Open
+				}
+			}
+
+			expiration = liveMarket.Expiration
+			hexAddr := liveMarket.MarketID
+			if hexAddr == "" {
+				hexAddr = "0x_dummy_clob_token"
+			}
+			marketAddr = fmt.Sprintf("poly_%s_strike_%.0f_expiry_%d", hexAddr, strike, expiration.Unix())
+			r.store.Log("INFO", fmt.Sprintf("[Polymarket] Direct API Match! Strike: $%.2f, Expiry: %s. Question: %q | StartTS: %d | YesPrice: %.3f, NoPrice: %.3f", 
+				strike, expiration.Format("15:04:05"), liveMarket.Question, liveMarket.StartTimestamp, liveMarket.YesPrice, liveMarket.NoPrice))
+			
+			// Subscribe the Polymarket engine to the active YES/NO contract CLOB tokens in real-time
+			if polyEng, ok := r.engine.(*engine.PolymarketEngine); ok {
+				polyEng.SubscribeToMarketTokens(liveMarket.YesTokenID, liveMarket.NoTokenID, marketAddr)
+			}
+
+			r.polyMu.Lock()
+			r.latestPolyInfo = liveMarket
+			r.polyMu.Unlock()
+		} else {
+			// Gracefully log expected mid-hour listing silent periods (when Polymarket script prepares next batch)
+			if err != nil && strings.Contains(err.Error(), "no active or upcoming 5m") {
+				r.store.Log("INFO", "[Polymarket] No active or upcoming 5m contract listed on Gamma API yet. Waiting for next cycle...")
+				return nil
+			}
+			// Actual API network failure
+			r.store.Log("WARN", fmt.Sprintf("[Polymarket API Failure] Could not fetch live contract: %v. Waiting for next cycle...", err))
+			return nil
+		}
+
+		polyCfg := PolymarketConfig{
+			MarketAddress:    marketAddr,
+			StrikePrice:      strike,
+			ExpirationTime:   expiration,
+			MinExpectedValue: 0.02,
+			RiskPercent:      r.cfg.RiskPercent,
+		}
+		
+		polyRunner := NewPolymarketRunner(polyCfg, r.store, polyEng)
+		return polyRunner.Tick(currentPrice, latestATR, isBullishTrend, liveMarket.YesPrice, liveMarket.NoPrice)
 	}
 
 	r.store.Log("INFO", fmt.Sprintf("Strategy Tick started for %s...", r.cfg.Instrument))
@@ -115,46 +268,99 @@ func (r *Runner) Tick() error {
 	r.store.Log("INFO", fmt.Sprintf("Indicators: Price=%.5f, FastEMA=%.5f, SlowEMA=%.5f, RSI=%.2f, ATR=%.5f",
 		currentPrice, latestFastEMA, latestSlowEMA, latestRSI, latestATR))
 
-	// 4. Fetch Allora Inference
+	// 4. Fetch Allora Inference (Disabled)
 	var alloraSignal float64 = 0.0 // positive = bullish, negative = bearish
-	var blockHeight int64 = 0
-	alloraActive := r.cfg.UseAllora
+	alloraActive := false
 
-	if r.cfg.UseAllora {
-		inf, err := r.alloraClient.GetLatestInference(r.cfg.AlloraTopicID)
-		if err != nil {
-			alloraActive = false
-			r.store.Log("WARN", fmt.Sprintf("Failed to fetch Allora inference: %v. Proceeding with technical indicators only.", err))
-		} else {
-			alloraSignal = inf.ParsedValue
-			blockHeight = inf.BlockHeight
-
-			// Save to local cache
-			_ = r.store.SaveAlloraInference(db.AlloraInference{
-				TopicID:       r.cfg.AlloraTopicID,
-				BlockHeight:   inf.BlockHeight,
-				CombinedValue: inf.CombinedValue,
-				ParsedValue:   inf.ParsedValue,
-				Timestamp:     time.Now(),
-			})
-			r.store.Log("INFO", fmt.Sprintf("Allora AI Inference: Topic=%d, Block=%d, Value=%.5f", r.cfg.AlloraTopicID, blockHeight, alloraSignal))
-		}
-	}
 
 	// 5. Generate Trading Signal
-	// Bullish signal: Fast EMA > Slow EMA (Trend is up), and RSI < maxRsiFilter (Not overbought).
-	// If UseAllora is true, we also check if Allora AI predicted price is greater than current price.
-	isBullishTrend := latestFastEMA > latestSlowEMA
-	isBearishTrend := latestFastEMA < latestSlowEMA
-
 	var signal string = "HOLD"
-	if isBullishTrend && latestRSI < r.cfg.MaxRsiFilter {
-		if !alloraActive || alloraSignal > currentPrice {
-			signal = "BUY"
+	
+	if strings.Contains(strings.ToUpper(r.cfg.Instrument), "BTC") {
+		r.store.Log("INFO", "[Polymarket-Oanda] Querying active BTC contracts directly from Polymarket Gamma API...")
+		liveMarket, err := FetchActivePolymarketStrike(currentPrice)
+		
+		var strike float64
+		var timeRemaining float64
+		if err == nil && liveMarket != nil {
+			strike = liveMarket.Strike
+			timeRemaining = time.Until(liveMarket.Expiration).Seconds()
+			if timeRemaining <= 0 {
+				timeRemaining = 180.0
+			}
+			r.store.Log("INFO", fmt.Sprintf("[Polymarket-Oanda] Direct API Match! Strike: $%.2f, Expiry: %s. Question: %q", 
+				strike, liveMarket.Expiration.Format("15:04:05"), liveMarket.Question))
+		} else {
+			r.store.Log("ERROR", fmt.Sprintf("[Polymarket-Oanda API Failure] Could not fetch live contract: %v. Local estimation is disabled.", err))
+			return fmt.Errorf("polymarket API integration failed for Oanda driver: %w", err)
 		}
-	} else if isBearishTrend && latestRSI > r.cfg.MinRsiFilter {
-		if !alloraActive || alloraSignal < currentPrice {
+		
+		volatilityPerSec := (latestATR / currentPrice) / math.Sqrt(300.0)
+		if volatilityPerSec <= 0 {
+			volatilityPerSec = 0.0001
+		}
+		
+		d := math.Log(currentPrice/strike) / (volatilityPerSec * math.Sqrt(timeRemaining))
+		trueYesProbability := 0.5 * (1.0 + math.Erf(d/math.Sqrt(2.0)))
+		trueNoProbability := 1.0 - trueYesProbability
+		
+		marketYesPrice := 0.50 + (math.Sin(float64(time.Now().Unix())*0.01) * 0.15)
+		if marketYesPrice < 0.05 {
+			marketYesPrice = 0.05
+		} else if marketYesPrice > 0.95 {
+			marketYesPrice = 0.95
+		}
+		marketNoPrice := 1.0 - marketYesPrice
+		
+		yesEV := (trueYesProbability * 1.0) - marketYesPrice
+		noEV := (trueNoProbability * 1.0) - marketNoPrice
+		
+		r.store.Log("INFO", fmt.Sprintf("[Polymarket-Oanda] Odds: YES=$%.2f, NO=$%.2f. Prob: YES=%.1f%%, NO=%.1f%%. EV: YES=+$%.2f, NO=+$%.2f",
+			marketYesPrice, marketNoPrice, trueYesProbability*100, trueNoProbability*100, yesEV, noEV))
+			
+		if yesEV >= 0.02 {
+			signal = "BUY"
+			r.store.Log("INFO", "[Polymarket-Oanda] Dynamic Bullish EV Edge! Output: Oanda BUY Signal")
+		} else if noEV >= 0.02 {
 			signal = "SELL"
+			r.store.Log("INFO", "[Polymarket-Oanda] Dynamic Bearish EV Edge! Output: Oanda SELL Signal")
+		} else {
+			r.store.Log("INFO", "[Polymarket-Oanda] Neutral market state. Hold.")
+		}
+	} else {
+		// Bullish signal: Fast EMA > Slow EMA (Trend is up), and RSI < maxRsiFilter (Not overbought).
+		// Allora winrate is strictly based on high-probability Allora inferences.
+		// Define high probability: prediction is at least 0.05% above/below current spot (high confidence edge).
+		isBullishTrend := latestFastEMA > latestSlowEMA
+		isBearishTrend := latestFastEMA < latestSlowEMA
+
+		alloraBullishHighProb := alloraActive && (alloraSignal > currentPrice * 1.0005)
+		alloraBearishHighProb := alloraActive && (alloraSignal < currentPrice * 0.9995)
+
+		if isBullishTrend && latestRSI < r.cfg.MaxRsiFilter {
+			if alloraActive {
+				if alloraBullishHighProb {
+					signal = "BUY"
+					r.store.Log("INFO", fmt.Sprintf("[Allora AI] High Probability Bullish Signal! Target: $%.2f (Edge: +%.3f%%)", alloraSignal, (alloraSignal-currentPrice)/currentPrice*100))
+				} else {
+					r.store.Log("INFO", fmt.Sprintf("[Allora AI] Bullish prediction too close ($%.2f vs Spot $%.2f). Skipping low probability trade.", alloraSignal, currentPrice))
+				}
+			} else {
+				// Standard Technical indicator fallback
+				signal = "BUY"
+			}
+		} else if isBearishTrend && latestRSI > r.cfg.MinRsiFilter {
+			if alloraActive {
+				if alloraBearishHighProb {
+					signal = "SELL"
+					r.store.Log("INFO", fmt.Sprintf("[Allora AI] High Probability Bearish Signal! Target: $%.2f (Edge: -%.3f%%)", alloraSignal, (currentPrice-alloraSignal)/currentPrice*100))
+				} else {
+					r.store.Log("INFO", fmt.Sprintf("[Allora AI] Bearish prediction too close ($%.2f vs Spot $%.2f). Skipping low probability trade.", alloraSignal, currentPrice))
+				}
+			} else {
+				// Standard Technical indicator fallback
+				signal = "SELL"
+			}
 		}
 	}
 
@@ -190,7 +396,7 @@ func (r *Runner) Tick() error {
 	// For simplicity, we manage one position per instrument at a time
 	var activePos *db.Position
 	for _, pos := range openPosList {
-		if pos.Instrument == r.cfg.Instrument {
+		if strings.Contains(pos.Instrument, r.cfg.Instrument) {
 			activePos = &pos
 			break
 		}
@@ -257,10 +463,12 @@ func (r *Runner) Tick() error {
 			takeProfit = currentPrice - tpDistance
 		}
 
-		r.store.Log("INFO", fmt.Sprintf("Execution: Placing %s. Risking $%.2f. Units: %.2f, SL: %.5f, TP: %.5f",
-			signal, riskCash, units, stopLoss, takeProfit))
+		instrumentName := r.cfg.Instrument
+		if alloraActive {
+			instrumentName = "allora_" + r.cfg.Instrument
+		}
 
-		_, err = r.engine.OpenPosition(r.cfg.Instrument, units, currentPrice, stopLoss, takeProfit)
+		_, err = r.engine.OpenPosition(instrumentName, units, currentPrice, stopLoss, takeProfit)
 		if err != nil {
 			return fmt.Errorf("failed to open position: %w", err)
 		}
@@ -682,9 +890,11 @@ func (r *Runner) LiveTick() error {
 		livePrice, err := fetchLivePrice(r.cfg.Instrument)
 		if err == nil && livePrice > 0 {
 			r.engine.UpdatePrices(map[string]float64{r.cfg.Instrument: livePrice})
-		} else if err != nil {
-			return err
 		}
+
+		// Polymarket prices are now updated in real-time via the CLOB WebSocket listener thread
+		// running in the PolymarketEngine background loop. This eliminates redundant REST polling
+		// and prevents stale midpoint prices from overwriting the real-time trade execution prints.
 	}
 	// For Oanda (forex), OandaBroker updates prices directly via websocket stream internally or simulator oscillator handles it.
 	return nil

@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"tiq/backend/pkg/allora"
 	"tiq/backend/pkg/api"
 	"tiq/backend/pkg/db"
 	"tiq/backend/pkg/engine"
@@ -23,11 +22,8 @@ func main() {
 	env := loadEnv(".env")
 
 	oandaKey := env["OANDA_KEY"]
-	alloraKey := env["ALLORA_KEY"]
-	alloraChain := env["ALLORA_CHAIN_ID"]
 	botMode := env["BOT_MODE"]           // "simulator", "demo" (Oanda Demo), "real" (Oanda Live)
 	instrument := env["INSTRUMENT"]       // e.g. "EUR_USD"
-	alloraTopic := env["ALLORA_TOPIC_ID"] // e.g. 1
 	dbPath := env["DB_PATH"]
 
 	// Set defaults
@@ -36,10 +32,6 @@ func main() {
 	}
 	if instrument == "" {
 		instrument = "BTC_USD"
-	}
-	topicID := 1
-	if alloraTopic != "" {
-		fmt.Sscanf(alloraTopic, "%d", &topicID)
 	}
 	if botMode == "" {
 		botMode = "simulator" // default to simulator
@@ -55,10 +47,8 @@ func main() {
 
 	// 3. Initialize Clients
 	var oClient *oanda.Client
-	var aClient *allora.Client
 	var execEngine engine.ExecutionEngine
 
-	aClient = allora.NewClient(alloraKey, alloraChain)
 	if oandaKey != "" {
 		isLive := botMode == "real"
 		oClient = oanda.NewClient(oandaKey, env["OANDA_ACCOUNT_ID"], isLive)
@@ -66,6 +56,15 @@ func main() {
 
 	// 4. Resolve Execution Engine
 	switch botMode {
+	case "polymarket":
+		store.Log("INFO", "Initializing Web3 Polymarket Execution Engine...")
+		poly, err := engine.NewPolymarketEngine(store, "", "")
+		if err != nil {
+			log.Fatalf("Critical: failed to create Polymarket engine: %v", err)
+		}
+		execEngine = poly
+		store.Log("INFO", "Web3 Polymarket Engine successfully loaded.")
+
 	case "demo", "real":
 		if oandaKey == "" {
 			log.Fatalf("Critical: OANDA_KEY is required for broker modes (demo/real)")
@@ -104,9 +103,8 @@ func main() {
 	// 5. Initialize Strategy Runner
 	stratConfig := strategy.Config{
 		Instrument:      instrument,
-		AlloraTopicID:   topicID,
 		Granularity:     "M5", // 5 minute bars
-		RiskPercent:     1.0,  // Risk 1% of balance per trade
+		RiskPercent:     50.0, // Risk 50% of balance per trade ($5 on a $10 balance)
 		AtrMultiplier:   2.0,  // SL is 2 * ATR
 		TpMultiplier:    3.0,  // TP is 3 * ATR
 		EmaFastPeriod:   10,
@@ -115,11 +113,11 @@ func main() {
 		MinRsiFilter:    30,
 		MaxRsiFilter:    70,
 		TradingEnabled:  true,
-		UseAllora:       alloraKey != "", // disable Allora if key is missing
+		UseAllora:       false,
 		DefaultPipValue: 0.0001,
 	}
 
-	runner := strategy.NewRunner(stratConfig, store, oClient, aClient, execEngine)
+	runner := strategy.NewRunner(stratConfig, store, oClient, nil, execEngine)
 
 	// Sync initial balance
 	_, _, err = execEngine.GetBalance()
@@ -131,9 +129,8 @@ func main() {
 	go func() {
 		store.Log("INFO", "Background strategy ticker started.")
 		// Oanda standard granularity M5 runs every 5 minutes.
-		// For immediate testing and fast demo simulation, we will run every 1 minute
-		// and query the latest prices.
-		ticker := time.NewTicker(1 * time.Minute)
+		// For immediate testing and fast demo simulation, we will run every 1 second.
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		// Run immediate tick on start
@@ -151,7 +148,7 @@ func main() {
 	// 6.5. Start Live Price Ticker in Background
 	go func() {
 		store.Log("INFO", "Background live price ticker started.")
-		liveTicker := time.NewTicker(2 * time.Second)
+		liveTicker := time.NewTicker(1 * time.Second)
 		defer liveTicker.Stop()
 
 		for range liveTicker.C {
@@ -162,7 +159,7 @@ func main() {
 	}()
 
 	// 7. Start REST API Server
-	serverPort := 8080
+	serverPort := 8081
 	apiServer := api.NewServer(store, runner, execEngine, serverPort)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("Critical: API Server stopped: %v", err)

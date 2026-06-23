@@ -302,18 +302,29 @@ type WinRateStats struct {
 	AvgLoss      float64 `json:"avg_loss"`
 }
 
-// GetWinRate computes win/loss statistics from all closed positions.
-func (db *DB) GetWinRate() (WinRateStats, error) {
-	query := `
+// CompleteWinRateStats holds overall and strategy-specific performance statistics.
+type CompleteWinRateStats struct {
+	WinRateStats
+	AlloraStats     WinRateStats `json:"allora_stats"`
+	PolymarketStats WinRateStats `json:"polymarket_stats"`
+}
+
+// GetWinRateByStrategy computes win/loss statistics from closed positions for a specific strategy type.
+func (db *DB) GetWinRateByStrategy(strategyType string) (WinRateStats, error) {
+	likeClause := "LIKE 'allora_%'"
+	if strategyType == "polymarket" {
+		likeClause = "LIKE 'poly_%'"
+	}
+	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) AS total,
-			SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
-			SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END) AS losses,
+			COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+			COALESCE(SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,
 			COALESCE(SUM(realized_pnl), 0) AS total_pnl,
 			COALESCE(AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END), 0) AS avg_win,
 			COALESCE(AVG(CASE WHEN realized_pnl <= 0 THEN realized_pnl END), 0) AS avg_loss
 		FROM positions
-		WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL;`
+		WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL AND instrument %s;`, likeClause)
 
 	var s WinRateStats
 	err := db.conn.QueryRow(query).Scan(
@@ -327,4 +338,46 @@ func (db *DB) GetWinRate() (WinRateStats, error) {
 		s.WinRate = float64(s.Wins) / float64(s.TotalTrades) * 100
 	}
 	return s, nil
+}
+
+// GetWinRate computes complete win/loss statistics including overall, Allora AI, and Polymarket EV stats.
+func (db *DB) GetWinRate() (CompleteWinRateStats, error) {
+	query := `
+		SELECT
+			COUNT(*) AS total,
+			COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+			COALESCE(SUM(CASE WHEN realized_pnl <= 0 THEN 1 ELSE 0 END), 0) AS losses,
+			COALESCE(SUM(realized_pnl), 0) AS total_pnl,
+			COALESCE(AVG(CASE WHEN realized_pnl > 0 THEN realized_pnl END), 0) AS avg_win,
+			COALESCE(AVG(CASE WHEN realized_pnl <= 0 THEN realized_pnl END), 0) AS avg_loss
+		FROM positions
+		WHERE status = 'CLOSED' AND realized_pnl IS NOT NULL;`
+
+	var overall WinRateStats
+	err := db.conn.QueryRow(query).Scan(
+		&overall.TotalTrades, &overall.Wins, &overall.Losses,
+		&overall.TotalPnL, &overall.AvgWin, &overall.AvgLoss,
+	)
+	if err != nil {
+		return CompleteWinRateStats{}, err
+	}
+	if overall.TotalTrades > 0 {
+		overall.WinRate = float64(overall.Wins) / float64(overall.TotalTrades) * 100
+	}
+
+	allora, err := db.GetWinRateByStrategy("allora")
+	if err != nil {
+		return CompleteWinRateStats{}, err
+	}
+
+	polymarket, err := db.GetWinRateByStrategy("polymarket")
+	if err != nil {
+		return CompleteWinRateStats{}, err
+	}
+
+	return CompleteWinRateStats{
+		WinRateStats:    overall,
+		AlloraStats:     allora,
+		PolymarketStats: polymarket,
+	}, nil
 }

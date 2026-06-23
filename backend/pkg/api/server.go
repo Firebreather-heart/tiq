@@ -73,12 +73,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	polyInfo := s.runner.GetLatestPolymarketInfo()
+
 	response := map[string]interface{}{
 		"runner_config": s.runner.GetConfig(),
 		"environment":   s.engine.GetEnvironment(),
 		"balance":       bal,
 		"equity":        eq,
 		"timestamp":     time.Now(),
+		"active_market": polyInfo,
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
@@ -131,21 +134,9 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInferences(w http.ResponseWriter, r *http.Request) {
-	limitStr := r.URL.Query().Get("limit")
-	limit := 50
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil {
-			limit = l
-		}
-	}
-
-	inferences, err := s.store.GetInferences(limit)
-	if err != nil {
-		s.writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to fetch inferences: %v", err))
-		return
-	}
-	s.writeJSON(w, http.StatusOK, inferences)
+	s.writeJSON(w, http.StatusOK, []string{})
 }
+
 
 func (s *Server) handleManualTrade(w http.ResponseWriter, r *http.Request) {
 	type ManualTradeReq struct {
