@@ -41,12 +41,25 @@ interface RunnerConfig {
   default_pip_value: number;
 }
 
+interface PolymarketMarketInfo {
+  question: string;
+  market_id: string;
+  strike: number;
+  expiration: string;
+  start_timestamp: number;
+  yes_price: number;
+  no_price: number;
+  yes_token_id: string;
+  no_token_id: string;
+}
+
 interface StatusData {
   runner_config: RunnerConfig;
   environment: string;
   balance: number;
   equity: number;
   timestamp: string;
+  active_market?: PolymarketMarketInfo | null;
 }
 
 interface Position {
@@ -88,6 +101,14 @@ interface AlloraInference {
   timestamp: string;
 }
 
+interface LiveTrade {
+  outcome: "YES" | "NO";
+  price: number;
+  size: number;
+  side: "BUY" | "SELL";
+  timestamp: string;
+}
+
 interface Candle {
   time: string;
   volume: number;
@@ -105,11 +126,29 @@ interface WinRateStats {
   total_pnl: number;
   avg_win: number;
   avg_loss: number;
+  allora_stats?: {
+    total_trades: number;
+    wins: number;
+    losses: number;
+    win_rate: number;
+    total_pnl: number;
+    avg_win: number;
+    avg_loss: number;
+  };
+  polymarket_stats?: {
+    total_trades: number;
+    wins: number;
+    losses: number;
+    win_rate: number;
+    total_pnl: number;
+    avg_win: number;
+    avg_loss: number;
+  };
 }
 
 export default function Home() {
   // Connection state
-  const [backendURL, setBackendURL] = useState("http://localhost:8080");
+  const [backendURL, setBackendURL] = useState("http://127.0.0.1:8081");
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(true);
 
@@ -118,7 +157,7 @@ export default function Home() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [trades, setTrades] = useState<Transaction[]>([]);
   const [logs, setLogs] = useState<SystemLog[]>([]);
-  const [inferences, setInferences] = useState<AlloraInference[]>([]);
+  const [liveTrades, setLiveTrades] = useState<LiveTrade[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [winStats, setWinStats] = useState<WinRateStats>({ total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0, avg_win: 0, avg_loss: 0 });
   const [livePrice, setLivePrice] = useState<number>(0);
@@ -187,10 +226,7 @@ export default function Home() {
       const logsData = await logsRes.json();
       setLogs(Array.isArray(logsData) ? logsData : []);
 
-      // Fetch inferences
-      const infRes = await fetch(`${backendURL}/api/inferences?limit=20`);
-      const infData = await infRes.json();
-      setInferences(Array.isArray(infData) ? infData : []);
+
 
       // Fetch candles
       const candlesRes = await fetch(`${backendURL}/api/candles?count=50`);
@@ -206,7 +242,9 @@ export default function Home() {
       try {
         const priceRes = await fetch(`${backendURL}/api/price`);
         const priceData = await priceRes.json();
-        if (priceData?.price) setLivePrice(priceData.price);
+        if (priceData?.price) {
+          setLivePrice((prev) => prev === 0 ? priceData.price : prev);
+        }
       } catch { /* silently ignore — will use candle fallback */ }
 
     } catch (err) {
@@ -218,7 +256,7 @@ export default function Home() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 1500); // 1.5s real-time fast-polling
+    const interval = setInterval(fetchData, 3000); // 3.0s real-time polling to reduce HTTP overhead
     return () => clearInterval(interval);
   }, [backendURL, status === null]);
 
@@ -228,6 +266,93 @@ export default function Home() {
       container.scrollTop = container.scrollHeight;
     }
   }, [logs]);
+
+  // Connect to Polymarket public WebSocket to stream trades in real-time
+  useEffect(() => {
+    const activeMarket = status?.active_market;
+    if (!activeMarket || !activeMarket.yes_token_id || !activeMarket.no_token_id) {
+      return;
+    }
+
+    // Connect to CLOB public websocket
+    const wsUrl = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    const socket = new WebSocket(wsUrl);
+
+    // Buffers to accumulate trades and the latest price to prevent re-render storms (which crash browsers under high load)
+    const pendingTrades: LiveTrade[] = [];
+    let latestPrice: number | null = null;
+
+    socket.onopen = () => {
+      // Subscribe to the trades channel for the active YES/NO outcomes
+      const subPayload = {
+        type: "market",
+        assets_ids: [activeMarket.yes_token_id, activeMarket.no_token_id],
+        custom_feature_enabled: true
+      };
+      socket.send(JSON.stringify(subPayload));
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const rawData = JSON.parse(event.data);
+        const events = Array.isArray(rawData) ? rawData : [rawData];
+
+        events.forEach((ev: any) => {
+          if (ev.event_type === "last_trade_price") {
+            const price = parseFloat(ev.price);
+            const size = parseFloat(ev.size);
+            if (!isNaN(price) && !isNaN(size)) {
+              const isYes = ev.asset_id === activeMarket.yes_token_id;
+              const isNo = ev.asset_id === activeMarket.no_token_id;
+              
+              // Only process completed trades that belong to the active YES/NO contract
+              if (isYes || isNo) {
+                pendingTrades.push({
+                  outcome: isYes ? "YES" : "NO",
+                  price,
+                  size,
+                  side: ev.side === "buy" || ev.side === "BUY" ? "BUY" : "SELL",
+                  timestamp: new Date().toLocaleTimeString()
+                });
+                
+                // Track latest YES-equivalent price
+                latestPrice = isYes ? price : (1.0 - price);
+              }
+            }
+          }
+        });
+      } catch (err) {
+        console.error("Error parsing Polymarket WS trade message:", err);
+      }
+    };
+
+    socket.onerror = (err) => {
+      console.error("Polymarket CLOB WebSocket Error:", err);
+    };
+
+    // Periodically flush accumulated trades and price updates to state once every 1000ms
+    const flushInterval = setInterval(() => {
+      if (pendingTrades.length > 0) {
+        const tradesToBatch = [...pendingTrades];
+        pendingTrades.length = 0; // Clear the buffer
+        setLiveTrades((prev) => {
+          const combined = [...tradesToBatch, ...prev];
+          return combined.slice(0, 20); // Limit to last 20 trades
+        });
+      }
+      if (latestPrice !== null) {
+        setLivePrice(latestPrice);
+        latestPrice = null;
+      }
+    }, 1000);
+
+    return () => {
+      clearInterval(flushInterval);
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close();
+      }
+    };
+  }, [status?.active_market?.yes_token_id, status?.active_market?.no_token_id]);
 
   // Handle bot config update
   const handleUpdateConfig = async (e: React.FormEvent) => {
@@ -750,9 +875,9 @@ export default function Home() {
           </div>
           <div>
             <h1 className="text-lg font-black tracking-wider text-slate-100 flex items-center gap-2">
-              TIQ <span className="text-[10px] bg-slate-900 border border-slate-800 text-slate-400 py-0.5 px-2 rounded-md font-mono uppercase tracking-normal">TIQ AI</span>
+              TIQ <span className="text-[10px] bg-slate-900 border border-slate-800 text-slate-400 py-0.5 px-2 rounded-md font-mono uppercase tracking-normal">Polymarket</span>
             </h1>
-            <p className="text-[10px] text-slate-500">Autonomous Oanda Forex Agent</p>
+            <p className="text-[10px] text-slate-500">Autonomous Web3 Polymarket Agent</p>
           </div>
         </div>
 
@@ -876,36 +1001,39 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Win Rate Card */}
+            {/* Latency Arbitrage Win Rate Card */}
             {(() => {
-              const rate = winStats.win_rate;
+              const polyStats = winStats.polymarket_stats || { total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0 };
+              const rate = polyStats.win_rate || 0;
+              const trades = polyStats.total_trades || 0;
+              const wins = polyStats.wins || 0;
+              const losses = polyStats.losses || 0;
+              const pnl = polyStats.total_pnl || 0;
               const isGood = rate >= 50;
-              const ringColor = rate === 0 ? "#334155" : isGood ? "#10b981" : "#f59e0b";
-              const textColor = rate === 0 ? "text-slate-500" : isGood ? "text-emerald-400" : "text-amber-400";
-              // SVG ring: r=18, circumference≈113.1
+              const ringColor = rate === 0 ? "#334155" : isGood ? "#3b82f6" : "#f59e0b";
+              const textColor = rate === 0 ? "text-slate-500" : isGood ? "text-blue-400" : "text-amber-400";
               const circum = 113.1;
               const dash = (rate / 100) * circum;
               return (
                 <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between gap-3">
                   <div className="flex-1 min-w-0">
-                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Win Rate</p>
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Latency Arbitrage</p>
                     <h3 className={`text-xl font-black mt-1 font-mono ${textColor}`}>
-                      {rate > 0 ? `${rate.toFixed(1)}%` : "—"}
+                      {trades > 0 ? `${rate.toFixed(1)}%` : "—"}
                     </h3>
-                    <div className="flex gap-3 mt-1.5 text-[9px] font-mono text-slate-500">
-                      <span className="text-emerald-500">{winStats.wins}W</span>
-                      <span className="text-rose-400">{winStats.losses}L</span>
-                      <span className={winStats.total_pnl >= 0 ? "text-emerald-400" : "text-rose-400"}>
-                        {winStats.total_pnl >= 0 ? "+" : ""}{winStats.total_pnl.toFixed(2)}
+                    <div className="flex gap-2 mt-1.5 text-[9px] font-mono text-slate-500">
+                      <span className="text-blue-400">{wins}W</span>
+                      <span className="text-rose-400">{losses}L</span>
+                      <span className={pnl >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                        {pnl >= 0 ? "+" : ""}{pnl.toFixed(2)}
                       </span>
                     </div>
                   </div>
-                  {/* Ring chart */}
                   <svg width="44" height="44" viewBox="0 0 44 44" className="shrink-0">
                     <circle cx="22" cy="22" r="18" fill="none" stroke="#1e293b" strokeWidth="4" />
-                    {rate > 0 && (
+                    {trades > 0 && (
                       <circle
-                        cx="22" cy="22" r="18"
+                         cx="22" cy="22" r="18"
                         fill="none"
                         stroke={ringColor}
                         strokeWidth="4"
@@ -915,8 +1043,8 @@ export default function Home() {
                         style={{ filter: `drop-shadow(0 0 4px ${ringColor})` }}
                       />
                     )}
-                    <text x="22" y="26" textAnchor="middle" fill={rate === 0 ? "#475569" : ringColor} fontSize="9" fontWeight="bold" fontFamily="monospace">
-                      {winStats.total_trades > 0 ? `${winStats.total_trades}T` : "0T"}
+                    <text x="22" y="26" textAnchor="middle" fill={trades === 0 ? "#475569" : ringColor} fontSize="9" fontWeight="bold" fontFamily="monospace">
+                      {trades}T
                     </text>
                   </svg>
                 </div>
@@ -961,37 +1089,58 @@ export default function Home() {
                         <th className="pb-2">Type</th>
                         <th className="pb-2 font-mono">Units</th>
                         <th className="pb-2 font-mono">Entry Price</th>
+                        <th className="pb-2 font-mono">Current Price</th>
                         <th className="pb-2 font-mono">SL / TP</th>
                         <th className="pb-2 text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
                       {positions.map((pos) => {
+                        const isPolymarket = pos.instrument.startsWith("poly_");
                         const isLong = pos.units > 0;
-                        const isMatchingInstrument = pos.instrument === status?.runner_config.instrument;
-                        // Use the live tick price when available (updated each strategy tick).
-                        // Fall back to last candle close, then entry price if neither is ready.
-                        const currentPrice =
-                          (isMatchingInstrument && livePrice > 0)
-                            ? livePrice
-                            : (isMatchingInstrument && candles.length > 0)
-                            ? candles[candles.length - 1].close
-                            : pos.open_price;
-                        const floatingPnl = (currentPrice - pos.open_price) * pos.units;
+                        const isMatchingInstrument = isPolymarket
+                          ? (status?.active_market && pos.instrument.includes(status.active_market.market_id))
+                          : pos.instrument === status?.runner_config.instrument;
+
+                        // Calculate current price based on live tick feed or fallback
+                        let currentPrice = pos.open_price;
+                        if (isMatchingInstrument) {
+                          if (isPolymarket) {
+                            if (livePrice > 0) {
+                              currentPrice = isLong ? livePrice : (1.0 - livePrice);
+                            } else if (status?.active_market) {
+                              currentPrice = isLong ? status.active_market.yes_price : status.active_market.no_price;
+                            }
+                          } else {
+                            currentPrice = livePrice > 0
+                              ? livePrice
+                              : (candles.length > 0 ? candles[candles.length - 1].close : pos.open_price);
+                          }
+                        }
+
+                        // Calculate PnL based on contract direction
+                        const floatingPnl = isPolymarket
+                          ? (currentPrice - pos.open_price) * Math.abs(pos.units)
+                          : (currentPrice - pos.open_price) * pos.units;
 
                         return (
                           <tr key={pos.id} className="border-b border-slate-900/40 hover:bg-slate-900/10">
                             <td className="py-3 font-semibold">{pos.instrument}</td>
                             <td className="py-3">
-                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${isLong ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-rose-500/10 text-rose-400 border border-rose-500/20"}`}>
-                                {isLong ? "BUY/LONG" : "SELL/SHORT"}
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${isLong ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20" : "bg-purple-500/10 text-purple-400 border border-purple-500/20"}`}>
+                                {isLong ? "YES Outcome" : "NO Outcome"}
                               </span>
                             </td>
                             <td className="py-3 font-mono">{Math.abs(pos.units).toLocaleString()}</td>
-                            <td className="py-3 font-mono">{pos.open_price.toFixed(5)}</td>
+                            <td className="py-3 font-mono">
+                              {isPolymarket ? `$${pos.open_price.toFixed(3)}` : pos.open_price.toFixed(5)}
+                            </td>
+                            <td className="py-3 font-mono">
+                              {isPolymarket ? `$${currentPrice.toFixed(3)}` : currentPrice.toFixed(5)}
+                            </td>
                             <td className="py-3 font-mono text-slate-400 text-[10px]">
-                              SL: {pos.stop_loss > 0 ? pos.stop_loss.toFixed(5) : "None"}<br />
-                              TP: {pos.take_profit > 0 ? pos.take_profit.toFixed(5) : "None"}
+                              {pos.stop_loss > 0 ? `SL: ${pos.stop_loss.toFixed(5)}` : "SL: None (No Liquidation)"}<br />
+                              Strike: ${pos.take_profit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                             </td>
                             <td className="py-3 text-right">
                               <div className="flex items-center justify-end gap-3">
@@ -1247,41 +1396,58 @@ export default function Home() {
             </form>
           </div>
 
-          {/* Allora AI Forecast Inference Cache */}
+          {/* Polymarket Public Real-Time Trade Stream */}
           <div className="bg-slate-900/20 border border-slate-900 p-5 rounded-2xl flex flex-col">
             <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2 mb-3 border-b border-slate-900 pb-3">
-              <Cpu className="w-4 h-4 text-emerald-400" /> Allora Network Inferences
+              <Activity className="w-4 h-4 text-emerald-400 animate-pulse" /> Polymarket Live Stream
             </h3>
 
-            {inferences.length === 0 ? (
-              <div className="text-center py-8 text-slate-500 text-xs">
-                No cached inferences found. Enable "Use Allora AI".
+            {/* Active Market Title/Context */}
+            {status?.active_market ? (
+              <div className="bg-slate-950/40 border border-slate-900/60 p-3 rounded-xl mb-3 flex flex-col gap-1 text-[11px]">
+                <div className="text-slate-300 font-semibold truncate">
+                  {status.active_market.question}
+                </div>
+                <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                  <span>Strike: ${status.active_market.strike?.toFixed(2)}</span>
+                  <span>Expiry: {new Date(status.active_market.expiration).toLocaleTimeString()}</span>
+                </div>
               </div>
             ) : (
-              <div className="overflow-y-auto max-h-56">
-                <div className="flex flex-col gap-2.5">
-                  {inferences.map((inf, idx) => {
-                    const isBullish = inf.parsed_value > 0;
+              <div className="text-[11px] text-slate-500 italic mb-3">
+                No active Polymarket contract matching...
+              </div>
+            )}
+
+            {liveTrades.length === 0 ? (
+              <div className="text-center py-12 text-slate-500 text-xs flex flex-col items-center justify-center gap-2">
+                <RefreshCw className="w-5 h-5 text-slate-600 animate-spin" />
+                <span>Listening for live execution prints on Polygon...</span>
+              </div>
+            ) : (
+              <div className="overflow-y-auto max-h-56 pr-1">
+                <div className="flex flex-col gap-2">
+                  {liveTrades.map((trade, idx) => {
+                    const isBuy = trade.side === "BUY";
+                    const isYes = trade.outcome === "YES";
                     return (
-                      <div key={idx} className="bg-slate-950/60 p-3 rounded-xl border border-slate-900 flex items-center justify-between text-xs hover:border-slate-800 transition">
-                        <div>
-                          <div className="flex items-center gap-1.5 text-slate-400 text-[10px]">
-                            <span>Topic {inf.topic_id}</span>
-                            <span>•</span>
-                            <span className="font-mono">Block #{inf.block_height}</span>
-                          </div>
-                          <div className="font-mono text-slate-200 font-bold mt-1 text-[10px] max-w-[140px] truncate">
-                            Value: {inf.combined_value}
-                          </div>
+                      <div key={idx} className="bg-slate-950/60 p-2.5 rounded-xl border border-slate-900/80 flex items-center justify-between text-xs hover:border-slate-800 transition">
+                        <div className="flex items-center gap-2">
+                          <span className={`px-2 py-0.5 rounded-md text-[9px] font-bold ${isYes ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20" : "bg-purple-500/10 text-purple-400 border border-purple-500/20"}`}>
+                            {trade.outcome}
+                          </span>
+                          <span className={`text-[10px] font-bold ${isBuy ? "text-emerald-400" : "text-rose-400"}`}>
+                            {trade.side}
+                          </span>
                         </div>
 
-                        <div className="text-right">
-                          <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold inline-flex items-center gap-0.5 ${isBullish ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-rose-500/10 text-rose-400 border border-rose-500/20"}`}>
-                            {isBullish ? <TrendingUp className="w-2.5 h-2.5" /> : <TrendingDown className="w-2.5 h-2.5" />}
-                            {isBullish ? "BULLISH" : "BEARISH"}
-                          </span>
-                          <span className="block text-[8px] text-slate-500 font-mono mt-1">
-                            {new Date(inf.timestamp).toLocaleTimeString()}
+                        <div className="flex items-center gap-4 text-right">
+                          <div>
+                            <span className="font-mono text-slate-200 font-bold">${trade.price.toFixed(3)}</span>
+                            <span className="block text-[9px] text-slate-500 font-mono mt-0.5">{trade.size.toLocaleString()} shares</span>
+                          </div>
+                          <span className="text-[9px] text-slate-500 font-mono">
+                            {trade.timestamp}
                           </span>
                         </div>
                       </div>
