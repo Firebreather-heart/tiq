@@ -272,6 +272,20 @@ func (db *DB) Log(level, message string) {
 	_, _ = db.conn.Exec(query, level, message, time.Now())
 }
 
+// PruneLogs caps the system_logs table at the most recent keepRows entries, deleting older
+// rows so a long-running bot can't bloat the database with WS trade prints indefinitely.
+func (db *DB) PruneLogs(keepRows int) (int64, error) {
+	res, err := db.conn.Exec(
+		`DELETE FROM system_logs WHERE id <= (SELECT MAX(id) FROM system_logs) - ?`,
+		keepRows,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (db *DB) GetLogs(limit int) ([]SystemLog, error) {
 	query := `SELECT id, level, message, timestamp FROM system_logs ORDER BY id DESC LIMIT ?;`
 	rows, err := db.conn.Query(query, limit)
@@ -380,4 +394,12 @@ func (db *DB) GetWinRate() (CompleteWinRateStats, error) {
 		AlloraStats:     allora,
 		PolymarketStats: polymarket,
 	}, nil
+}
+
+// HasTradedInstrument returns true if the specified instrument has already been traded (open or closed position).
+func (db *DB) HasTradedInstrument(instrument string) (bool, error) {
+	var count int
+	query := `SELECT COUNT(*) FROM positions WHERE instrument = ?;`
+	err := db.conn.QueryRow(query, instrument).Scan(&count)
+	return count > 0, err
 }

@@ -211,12 +211,21 @@ func (r *Runner) Tick() error {
 			MarketAddress:    marketAddr,
 			StrikePrice:      strike,
 			ExpirationTime:   expiration,
-			MinExpectedValue: 0.02,
+			MinExpectedValue: 0.05,
 			RiskPercent:      r.cfg.RiskPercent,
 		}
 		
 		polyRunner := NewPolymarketRunner(polyCfg, r.store, polyEng)
-		return polyRunner.Tick(currentPrice, latestATR, isBullishTrend, liveMarket.YesPrice, liveMarket.NoPrice)
+
+		// H: prefer the fresh WS-fed token price over the (polled, seconds-old) Gamma quote
+		// for the EV decision — a latency scalp must act on the freshest mispricing. Fall back
+		// to the Gamma quote when the WS feed hasn't reported for this contract yet.
+		yesPx, noPx := liveMarket.YesPrice, liveMarket.NoPrice
+		if wsYes, ok := polyEng.GetPrice(marketAddr); ok && wsYes > 0 && wsYes < 1 {
+			yesPx = wsYes
+			noPx = 1.0 - wsYes
+		}
+		return polyRunner.Tick(currentPrice, latestATR, isBullishTrend, yesPx, noPx)
 	}
 
 	r.store.Log("INFO", fmt.Sprintf("Strategy Tick started for %s...", r.cfg.Instrument))
@@ -589,7 +598,7 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	instUpper := strings.ToUpper(instrument)
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 
-	// Fetch live crypto candles from Kraken (routed via proxy)
+	// Fetch live crypto candles from Kraken via proxy
 	if isCrypto {
 		candles, err = fetchKrakenCandles(instrument, count)
 		if err != nil {
@@ -597,7 +606,6 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 		}
 
 		if len(candles) > 0 {
-			// Initialize or update simulator base price with the real live crypto close price
 			r.engine.UpdatePrices(map[string]float64{instrument: candles[len(candles)-1].Close})
 		}
 	}
@@ -900,14 +908,14 @@ func (r *Runner) LiveTick() error {
 	return nil
 }
 
-// fetchLivePrice retrieves the sub-second live spot price from Coinbase (primary for crypto) or Bybit
+// fetchLivePrice retrieves the sub-second live spot price from Kraken via proxy (primary) or Bybit via proxy (fallback)
 func fetchLivePrice(symbol string) (float64, error) {
 	instUpper := strings.ToUpper(symbol)
 	isBTC := strings.Contains(instUpper, "BTC")
 	isETH := strings.Contains(instUpper, "ETH")
 
 	if isBTC || isETH {
-		// Use Kraken API (routed via proxy) as the primary, ultra-reliable spot price feed
+		// Primary: Kraken Ticker via proxy
 		var pair string
 		if isBTC {
 			pair = "XBTUSD"
@@ -928,7 +936,7 @@ func fetchLivePrice(symbol string) (float64, error) {
 			req.Header.Set("User-Agent", "TIQ-AI-Agent/1.0")
 			clientTimeout := 2 * time.Second
 			if proxyURL != "" {
-				clientTimeout = 180 * time.Second // Allow extra time for Render spin down (up to 180 seconds)
+				clientTimeout = 180 * time.Second
 			}
 			client := &http.Client{Timeout: clientTimeout}
 			resp, err := client.Do(req)
@@ -940,13 +948,11 @@ func fetchLivePrice(symbol string) (float64, error) {
 						Result map[string]interface{} `json:"result"`
 					}
 					if err := json.NewDecoder(resp.Body).Decode(&rawResponse); err == nil && len(rawResponse.Error) == 0 {
-						// Kraken returns nested map, find the pair key (could be XXBTZUSD or XETHZUSD or symbol)
 						for k, v := range rawResponse.Result {
 							if k == "error" {
 								continue
 							}
 							if dataMap, ok := v.(map[string]interface{}); ok {
-								// "c" is last trade closed array, first element is price string
 								if cArr, ok := dataMap["c"].([]interface{}); ok && len(cArr) > 0 {
 									if priceStr, ok := cArr[0].(string); ok {
 										price, err := strconv.ParseFloat(priceStr, 64)

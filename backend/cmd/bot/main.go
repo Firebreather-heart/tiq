@@ -19,7 +19,11 @@ func main() {
 	log.Println("Starting Allora-Oanda Trading Bot...")
 
 	// 1. Load env variables manually from .env (to stick to standard library)
-	env := loadEnv(".env")
+	// Check backend/.env first (when running bot.exe from project root), then fall back to .env
+	env := loadEnv("backend/.env")
+	if len(env) == 0 {
+		env = loadEnv(".env")
+	}
 
 	oandaKey := env["OANDA_KEY"]
 	botMode := env["BOT_MODE"]           // "simulator", "demo" (Oanda Demo), "real" (Oanda Live)
@@ -154,6 +158,24 @@ func main() {
 		for range liveTicker.C {
 			if err := runner.LiveTick(); err != nil {
 				// Silently handle to prevent spamming logs
+			}
+		}
+	}()
+
+	// 6.6. Start log-retention pruner: keep the most recent 200k log rows so the SQLite DB
+	// can't grow unbounded from high-frequency WS trade prints on a 24/7 run.
+	go func() {
+		const keepRows = 200000
+		pruneTicker := time.NewTicker(15 * time.Minute)
+		defer pruneTicker.Stop()
+
+		// Trim any existing backlog once on startup, then on the interval.
+		if n, err := store.PruneLogs(keepRows); err == nil && n > 0 {
+			store.Log("INFO", fmt.Sprintf("Log retention: pruned %d old log rows (keeping last %d).", n, keepRows))
+		}
+		for range pruneTicker.C {
+			if n, err := store.PruneLogs(keepRows); err == nil && n > 0 {
+				store.Log("INFO", fmt.Sprintf("Log retention: pruned %d old log rows (keeping last %d).", n, keepRows))
 			}
 		}
 	}()

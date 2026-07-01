@@ -40,26 +40,72 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 		return nil
 	}
 
-	// Limit trade entry to the first 2 minutes of the active contract (between 300s and 180s remaining)
-	if timeRemaining < 180.0 || timeRemaining > 300.0 {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Time remaining (%.0fs) is outside the first 2 minutes entry window (180s to 300s). Skipping trade.", timeRemaining))
+	// 1. Position Check: Always monitor open positions first, even outside the entry window
+	openShares, err := pr.polyEngine.GetOpenPositions()
+	if err != nil {
+		return err
+	}
+
+	// Extract the unique hex address/condition ID from the market address to prevent duplicate entries on the same contract
+	var currentCondID string
+	parts := strings.Split(pr.cfg.MarketAddress, "_")
+	if len(parts) >= 2 {
+		currentCondID = parts[1]
+	}
+
+	for _, pos := range openShares {
+		posParts := strings.Split(pos.Instrument, "_")
+		if len(posParts) >= 2 && posParts[1] == currentCondID {
+			// Position exists for this contract! Check exit condition.
+			isLong := pos.Units > 0
+			var currentSharePrice float64
+			if isLong {
+				currentSharePrice = marketYesPrice
+			} else {
+				currentSharePrice = marketNoPrice
+			}
+
+			// Update the price of the actual open position's instrument ID (YES price) in the engine feed
+			_ = pr.polyEngine.UpdatePrices(map[string]float64{
+				pos.Instrument: marketYesPrice,
+			})
+			// Scalp take-profit: exit once the token reprices up to the stored catch-up target
+			if pos.TakeProfit > 0 && currentSharePrice >= pos.TakeProfit {
+				pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Take Profit triggered! Share Price: $%.3f >= Target: $%.3f (Entry: $%.3f). Closing position.",
+					currentSharePrice, pos.TakeProfit, pos.OpenPrice))
+				err = pr.polyEngine.ClosePosition(pos.ID, currentSharePrice)
+				return err
+			}
+			return nil
+		}
+	}
+
+	// Entry window: from contract open (~300s) down to 150s remaining. This leaves >=60s of
+	// runway before the 90s scalp-flatten and stays clear of the near-expiry zone where the
+	// probability model saturates. Re-entry within this window is allowed (see below).
+	if timeRemaining < 150.0 || timeRemaining > 300.0 {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Time remaining (%.0fs) is outside the entry window (150s to 300s). Skipping trade.", timeRemaining))
 		return nil
 	}
 
-	// Dynamically scale minimum lag using ATR: Require lag >= 0.75 * ATR (with a $20 floor)
-	minLag := 0.75 * atr
-	if minLag < 20.0 {
-		minLag = 20.0
-	}
+	// Entry lag window: BTC must have moved enough to signal a real edge, but not so much that
+	// Polymarket has already repriced the token past the boundary. $30 minimum ensures real signal;
+	// $100 maximum ensures we're still early enough to buy before Polymarket catches up.
+	const minLag = 30.0
+	const maxLag = 100.0
 
 	lag := math.Abs(currentPrice - pr.cfg.StrikePrice)
 	if lag < minLag {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Current lag ($%.2f) is less than the required dynamic minimum of $%.2f (0.75 * ATR). Skipping trade.", lag, minLag))
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Current lag ($%.2f) below minimum $%.2f. Skipping trade.", lag, minLag))
+		return nil
+	}
+	if lag > maxLag {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Current lag ($%.2f) above maximum $%.2f — Polymarket likely repriced. Skipping trade.", lag, maxLag))
 		return nil
 	}
 
-	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Evaluating Market %s. Expiry in %.0fs. Current Spot: $%.2f | Dynamic Min Lag: $%.2f", 
-		pr.cfg.MarketAddress, timeRemaining, currentPrice, minLag))
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Evaluating Market %s. Expiry in %.0fs. Current Spot: $%.2f | Lag: $%.2f (min: $%.2f)",
+		pr.cfg.MarketAddress, timeRemaining, currentPrice, lag, minLag))
 
 	// 1. Calculate True Probability of resolving YES using the Volatility Engine
 	// Volatility per second scaled down from standard 5m ATR
@@ -95,50 +141,17 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Expected Value Edge: YES=+$%.2f USDC, NO=+$%.2f USDC", 
 		yesEV, noEV))
 
-	// 4. Position Check
-	openShares, err := pr.polyEngine.GetOpenPositions()
-	if err != nil {
-		return err
-	}
+	// 4. expected value calculations already completed. Skip check since it was moved to the top.
 
-	// Extract the unique hex address/condition ID from the market address to prevent duplicate entries on the same contract
-	var currentCondID string
-	parts := strings.Split(pr.cfg.MarketAddress, "_")
-	if len(parts) >= 2 {
-		currentCondID = parts[1]
-	}
-
-	for _, pos := range openShares {
-		posParts := strings.Split(pos.Instrument, "_")
-		if len(posParts) >= 2 && posParts[1] == currentCondID {
-			// Position exists for this contract! Check exit condition.
-			isLong := pos.Units > 0
-			var currentSharePrice float64
-			if isLong {
-				currentSharePrice = marketYesPrice
-			} else {
-				currentSharePrice = marketNoPrice
-			}
-
-			profitPercent := (currentSharePrice - pos.OpenPrice) / pos.OpenPrice
-			
-			// Update the price of the actual open position's instrument ID (YES price) in the engine feed
-			_ = pr.polyEngine.UpdatePrices(map[string]float64{
-				pos.Instrument: marketYesPrice,
-			})
-			if profitPercent >= 0.20 {
-				pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Take Profit triggered! Share Price: %.2f (Entry: %.2f, Profit: %.1f%% >= 20%%). Closing position.", 
-					currentSharePrice, pos.OpenPrice, profitPercent*100))
-				err = pr.polyEngine.ClosePosition(pos.ID, currentSharePrice)
-				return err
-			}
-			return nil 
-		}
-	}
-
-	// 5. Open Position if Expected Value exceeds our Edge target
+	// 5. Open Position if Expected Value exceeds our Edge target.
+	// Re-entry is intentionally allowed for scalping: the open-position check at the top of
+	// Tick already prevents holding two positions on the same contract (no stacking), and the
+	// EV-edge + lag gates above self-regulate — we only re-enter once a genuinely fresh
+	// mispricing reappears after a prior scalp has closed. (A previous one-trade-per-contract
+	// block strangled scalp frequency and has been removed.)
 	_, _, err = pr.polyEngine.GetBalance()
 	if err != nil {
+		pr.store.Log("ERROR", fmt.Sprintf("[Polymarket Strategy] GetBalance failed, skipping trade: %v", err))
 		return err
 	}
 
@@ -146,46 +159,55 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	riskCapital := 5.00
 
 	if yesEV >= pr.cfg.MinExpectedValue {
-		// Boundary check: Only enter YES if price is between $0.40 and $0.60
-		if marketYesPrice < 0.40 || marketYesPrice > 0.60 {
-			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected, but YES price ($%.2f) is outside the $0.40 - $0.60 entry boundaries. Skipping YES trade.", marketYesPrice))
+		// Boundary check: token must still be near $0.50 — if it's already repriced past this
+		// range, Polymarket has already recognized the lag and the entry opportunity is gone.
+		if marketYesPrice < 0.35 || marketYesPrice > 0.65 {
+			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected but YES price ($%.2f) shows Polymarket has already repriced. Entry window closed.", marketYesPrice))
 			return nil
 		}
 
-		// Trend momentum check: Only enter YES if short-term EMA trend is bullish
-		if !isBullishTrend {
-			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected, but short-term EMA trend is bearish. Skipping YES trade. Spot: $%.2f, Strike: $%.2f", currentPrice, pr.cfg.StrikePrice))
-			return nil
+		// Verify Struct order book depth — soft check only (Struct connects post-entry, so book
+		// may be empty at evaluation time; warn but do not block).
+		ok, err := pr.polyEngine.CheckOrderBookLiquidity(true, 3.0*riskCapital)
+		if err != nil {
+			pr.store.Log("WARN", fmt.Sprintf("[Polymarket Strategy] Liquidity check error (non-blocking): %v", err))
+		}
+		if !ok {
+			pr.store.Log("INFO", "[Polymarket Strategy] Order book thin or unavailable — proceeding anyway (Struct not yet connected).")
 		}
 
 		// Buy YES tokens
 		units := riskCapital / marketYesPrice
 		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected! Buying %.2f YES tokens. Risk USDC: $%.2f", units, riskCapital))
 		
-		// Set dynamic limits: SL = entryPrice - 0.03 (3-cent buffer to avoid premature stop-outs), TP = marketYesPrice * 1.20 (20% Profit level)
-		_, err = pr.polyEngine.OpenPosition(targetInstrument, units, marketYesPrice, marketYesPrice - 0.03, marketYesPrice * 1.20)
+		// Scalp limits: SL = entry - 0.03 (tight stop), TP = entry + 60% of the entry edge (fast catch-up exit before the lag closes)
+		_, err = pr.polyEngine.OpenPosition(targetInstrument, units, marketYesPrice, marketYesPrice - 0.03, marketYesPrice + 0.6*yesEV)
 		if err != nil {
 			return err
 		}
 	} else if noEV >= pr.cfg.MinExpectedValue {
-		// Boundary check: Only enter NO if price is between $0.40 and $0.60
-		if marketNoPrice < 0.40 || marketNoPrice > 0.60 {
-			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected, but NO price ($%.2f) is outside the $0.40 - $0.60 entry boundaries. Skipping NO trade.", marketNoPrice))
+		// Boundary check: token must still be near $0.50 — already repriced = opportunity gone.
+		if marketNoPrice < 0.35 || marketNoPrice > 0.65 {
+			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected but NO price ($%.2f) shows Polymarket has already repriced. Entry window closed.", marketNoPrice))
 			return nil
 		}
 
-		// Trend momentum check: Only enter NO if short-term EMA trend is bearish (not bullish)
-		if isBullishTrend {
-			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected, but short-term EMA trend is bullish. Skipping NO trade. Spot: $%.2f, Strike: $%.2f", currentPrice, pr.cfg.StrikePrice))
-			return nil
+		// Verify Struct order book depth — soft check only (Struct connects post-entry, so book
+		// may be empty at evaluation time; warn but do not block).
+		ok, err := pr.polyEngine.CheckOrderBookLiquidity(false, 3.0*riskCapital)
+		if err != nil {
+			pr.store.Log("WARN", fmt.Sprintf("[Polymarket Strategy] Liquidity check error (non-blocking): %v", err))
+		}
+		if !ok {
+			pr.store.Log("INFO", "[Polymarket Strategy] Order book thin or unavailable — proceeding anyway (Struct not yet connected).")
 		}
 
 		// Buy NO tokens (represented as negative units)
 		units := -riskCapital / marketNoPrice
 		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected! Buying %.2f NO tokens. Risk USDC: $%.2f", math.Abs(units), riskCapital))
 		
-		// Set dynamic limits: SL = entryPrice - 0.03 (3-cent buffer to avoid premature stop-outs), TP = marketNoPrice * 1.20 (20% Profit level)
-		_, err = pr.polyEngine.OpenPosition(targetInstrument, units, marketNoPrice, marketNoPrice - 0.03, marketNoPrice * 1.20)
+		// Scalp limits: SL = entry - 0.03 (tight stop), TP = entry + 60% of the entry edge (fast catch-up exit before the lag closes)
+		_, err = pr.polyEngine.OpenPosition(targetInstrument, units, marketNoPrice, marketNoPrice - 0.03, marketNoPrice + 0.6*noEV)
 		if err != nil {
 			return err
 		}

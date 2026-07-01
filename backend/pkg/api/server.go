@@ -75,13 +75,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	polyInfo := s.runner.GetLatestPolymarketInfo()
 
+	mode := "broker"
+	if _, isPoly := s.engine.(*engine.PolymarketEngine); isPoly {
+		mode = "polymarket"
+	}
+
 	response := map[string]interface{}{
-		"runner_config": s.runner.GetConfig(),
-		"environment":   s.engine.GetEnvironment(),
-		"balance":       bal,
-		"equity":        eq,
-		"timestamp":     time.Now(),
-		"active_market": polyInfo,
+		"runner_config":  s.runner.GetConfig(),
+		"environment":    s.engine.GetEnvironment(),
+		"mode":           mode,
+		"balance":        bal,
+		"equity":         eq,
+		"timestamp":      time.Now(),
+		"active_market":  polyInfo,
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
@@ -155,6 +161,14 @@ func (s *Server) handleManualTrade(w http.ResponseWriter, r *http.Request) {
 
 	if req.Instrument == "" || req.Units == 0 || req.Price == 0 {
 		s.writeJSONError(w, http.StatusBadRequest, "Missing required parameters (instrument, units, price)")
+		return
+	}
+
+	// Manual trades are nonsensical in Polymarket mode (the request carries a spot symbol/size,
+	// not a YES/NO outcome token) and would create unmanageable junk positions. Block them; the
+	// scalp strategy manages all entries automatically.
+	if _, isPoly := s.engine.(*engine.PolymarketEngine); isPoly {
+		s.writeJSONError(w, http.StatusBadRequest, "Manual trading is disabled in Polymarket mode — the scalp strategy manages entries automatically.")
 		return
 	}
 

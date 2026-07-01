@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Play,
   Pause,
@@ -56,10 +56,12 @@ interface PolymarketMarketInfo {
 interface StatusData {
   runner_config: RunnerConfig;
   environment: string;
+  mode?: string; // "polymarket" | "broker"
   balance: number;
   equity: number;
   timestamp: string;
   active_market?: PolymarketMarketInfo | null;
+  struct_api_key?: string;
 }
 
 interface Position {
@@ -107,6 +109,7 @@ interface LiveTrade {
   size: number;
   side: "BUY" | "SELL";
   timestamp: string;
+  usd_value?: number;
 }
 
 interface Candle {
@@ -148,7 +151,7 @@ interface WinRateStats {
 
 export default function Home() {
   // Connection state
-  const [backendURL, setBackendURL] = useState("http://127.0.0.1:8081");
+  const [backendURL, setBackendURL] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(true);
 
@@ -163,7 +166,7 @@ export default function Home() {
   const [livePrice, setLivePrice] = useState<number>(0);
 
   // Local Form state
-  const [instrument, setInstrument] = useState("EUR_USD");
+  const [instrument, setInstrument] = useState("BTC_USD");
   const [alloraTopicID, setAlloraTopicID] = useState(1);
   const [riskPercent, setRiskPercent] = useState(1.0);
   const [atrMultiplier, setAtrMultiplier] = useState(2.0);
@@ -188,10 +191,20 @@ export default function Home() {
   // Log terminal container ref
   const terminalContainerRef = useRef<HTMLDivElement>(null);
 
-  // Fetch initial & interval data
-  const fetchData = async () => {
+  // RAF handle for mouse-move throttling — prevents hundreds of re-renders/sec
+  const rafRef = useRef<number | null>(null);
+  // One-time config initialisation guard (replaces `status === null` in effect deps)
+  const initializedRef = useRef(false);
+  // Tick counter for staggered slow-data polling
+  const tickRef = useRef(0);
+
+  // Fetch initial & interval data.
+  // Fast data (status, positions, logs, stats, price) polls every tick (3s).
+  // Slow data (trades every 5th tick ~15s, candles every 10th tick ~30s) to cut GC pressure.
+  const fetchData = useCallback(async () => {
+    tickRef.current++;
+    const tick = tickRef.current;
     try {
-      // Test status
       const statusRes = await fetch(`${backendURL}/api/status`);
       if (!statusRes.ok) throw new Error("Backend unreachable");
       const statusData: StatusData = await statusRes.json();
@@ -199,7 +212,8 @@ export default function Home() {
       setIsConnected(true);
 
       // Populate config form inputs once on first load
-      if (!status) {
+      if (!initializedRef.current) {
+        initializedRef.current = true;
         setInstrument(statusData.runner_config.instrument);
         setAlloraTopicID(statusData.runner_config.allora_topic_id);
         setRiskPercent(statusData.runner_config.risk_percent);
@@ -211,34 +225,34 @@ export default function Home() {
         setUseAllora(statusData.runner_config.use_allora);
       }
 
-      // Fetch positions
+      // Fast polls — every tick
       const posRes = await fetch(`${backendURL}/api/positions`);
       const posData = await posRes.json();
       setPositions(Array.isArray(posData) ? posData : []);
 
-      // Fetch trades
-      const tradesRes = await fetch(`${backendURL}/api/trades`);
-      const tradesData = await tradesRes.json();
-      setTrades(Array.isArray(tradesData) ? tradesData : []);
-
-      // Fetch logs
-      const logsRes = await fetch(`${backendURL}/api/logs?limit=40`);
+      const logsRes = await fetch(`${backendURL}/api/logs?limit=30`);
       const logsData = await logsRes.json();
       setLogs(Array.isArray(logsData) ? logsData : []);
 
-
-
-      // Fetch candles
-      const candlesRes = await fetch(`${backendURL}/api/candles?count=50`);
-      const candlesData = await candlesRes.json();
-      setCandles(Array.isArray(candlesData) ? candlesData : []);
-
-      // Fetch win rate stats
       const statsRes = await fetch(`${backendURL}/api/stats`);
       const statsData = await statsRes.json();
       if (statsData && typeof statsData.win_rate === 'number') setWinStats(statsData);
 
-      // Fetch live tick price (updated every strategy tick, much fresher than candle close)
+      // Medium poll — trades every 5 ticks (~15s); history changes infrequently
+      if (tick % 5 === 1) {
+        const tradesRes = await fetch(`${backendURL}/api/trades`);
+        const tradesData = await tradesRes.json();
+        setTrades(Array.isArray(tradesData) ? tradesData : []);
+      }
+
+      // Slow poll — candles every 10 ticks (~30s); 5m bars don't need fast refresh
+      if (tick % 10 === 1) {
+        const candlesRes = await fetch(`${backendURL}/api/candles?count=50`);
+        const candlesData = await candlesRes.json();
+        setCandles(Array.isArray(candlesData) ? candlesData : []);
+      }
+
+      // Live price — always, fast, tiny payload
       try {
         const priceRes = await fetch(`${backendURL}/api/price`);
         const priceData = await priceRes.json();
@@ -252,13 +266,19 @@ export default function Home() {
     } finally {
       setIsConnecting(false);
     }
-  };
+  }, [backendURL]);
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 3000); // 3.0s real-time polling to reduce HTTP overhead
-    return () => clearInterval(interval);
-  }, [backendURL, status === null]);
+    tickRef.current = 0;
+    initializedRef.current = false;
+    // Defer the initial fetch out of the effect body so it doesn't setState synchronously.
+    const initial = setTimeout(fetchData, 0);
+    const interval = setInterval(fetchData, 3000);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
+  }, [fetchData]);
 
   useEffect(() => {
     if (terminalContainerRef.current) {
@@ -267,15 +287,21 @@ export default function Home() {
     }
   }, [logs]);
 
-  // Connect to Polymarket public WebSocket to stream trades in real-time
+  // Connect to Struct or Polymarket public WebSocket to stream trades in real-time
   useEffect(() => {
     const activeMarket = status?.active_market;
     if (!activeMarket || !activeMarket.yes_token_id || !activeMarket.no_token_id) {
       return;
     }
 
-    // Connect to CLOB public websocket
-    const wsUrl = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    const structApiKey = status?.struct_api_key;
+    const useStruct = !!structApiKey;
+
+    // Connect to Struct WS if api key exists, otherwise fall back to raw Polymarket CLOB WS
+    const wsUrl = useStruct
+      ? `wss://api.struct.to/ws?api-key=${structApiKey}`
+      : "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+      
     const socket = new WebSocket(wsUrl);
 
     // Buffers to accumulate trades and the latest price to prevent re-render storms (which crash browsers under high load)
@@ -283,51 +309,93 @@ export default function Home() {
     let latestPrice: number | null = null;
 
     socket.onopen = () => {
-      // Subscribe to the trades channel for the active YES/NO outcomes
-      const subPayload = {
-        type: "market",
-        assets_ids: [activeMarket.yes_token_id, activeMarket.no_token_id],
-        custom_feature_enabled: true
-      };
-      socket.send(JSON.stringify(subPayload));
+      if (useStruct) {
+        // 1. Join room
+        socket.send(JSON.stringify({
+          type: "join_room",
+          payload: { room_id: "polymarket_trades" }
+        }));
+        // 2. Subscribe to YES and NO position IDs
+        socket.send(JSON.stringify({
+          type: "room_message",
+          payload: {
+            room_id: "polymarket_trades",
+            message: {
+              action: "subscribe",
+              position_ids: [activeMarket.yes_token_id, activeMarket.no_token_id]
+            }
+          }
+        }));
+      } else {
+        // Subscribe to raw Polymarket CLOB
+        const subPayload = {
+          type: "market",
+          assets_ids: [activeMarket.yes_token_id, activeMarket.no_token_id],
+          custom_feature_enabled: true
+        };
+        socket.send(JSON.stringify(subPayload));
+      }
     };
 
     socket.onmessage = (event) => {
       try {
         const rawData = JSON.parse(event.data);
-        const events = Array.isArray(rawData) ? rawData : [rawData];
 
-        events.forEach((ev: any) => {
-          if (ev.event_type === "last_trade_price") {
-            const price = parseFloat(ev.price);
-            const size = parseFloat(ev.size);
-            if (!isNaN(price) && !isNaN(size)) {
-              const isYes = ev.asset_id === activeMarket.yes_token_id;
-              const isNo = ev.asset_id === activeMarket.no_token_id;
-              
-              // Only process completed trades that belong to the active YES/NO contract
+        if (useStruct) {
+          if (rawData.type === "trade_stream_update" && rawData.room_id === "polymarket_trades") {
+            const trade = rawData.data;
+            if (trade && trade.trade_type === "OrderFilled") {
+              const isYes = trade.position_id === activeMarket.yes_token_id;
+              const isNo = trade.position_id === activeMarket.no_token_id;
+
               if (isYes || isNo) {
                 pendingTrades.push({
                   outcome: isYes ? "YES" : "NO",
-                  price,
-                  size,
-                  side: ev.side === "buy" || ev.side === "BUY" ? "BUY" : "SELL",
-                  timestamp: new Date().toLocaleTimeString()
+                  price: trade.price,
+                  size: trade.shares_amount,
+                  side: trade.side === "Buy" || trade.side === "BUY" ? "BUY" : "SELL",
+                  timestamp: new Date().toLocaleTimeString(),
+                  usd_value: trade.usd_amount
                 });
-                
+
                 // Track latest YES-equivalent price
-                latestPrice = isYes ? price : (1.0 - price);
+                latestPrice = isYes ? trade.price : (1.0 - trade.price);
               }
             }
           }
-        });
+        } else {
+          const events = Array.isArray(rawData) ? rawData : [rawData];
+          events.forEach((ev: { event_type: string; price: string; size: string; asset_id: string; side: string }) => {
+            if (ev.event_type === "last_trade_price") {
+              const price = parseFloat(ev.price);
+              const size = parseFloat(ev.size);
+              if (!isNaN(price) && !isNaN(size)) {
+                const isYes = ev.asset_id === activeMarket.yes_token_id;
+                const isNo = ev.asset_id === activeMarket.no_token_id;
+
+                if (isYes || isNo) {
+                  pendingTrades.push({
+                    outcome: isYes ? "YES" : "NO",
+                    price,
+                    size,
+                    side: ev.side === "buy" || ev.side === "BUY" ? "BUY" : "SELL",
+                    timestamp: new Date().toLocaleTimeString()
+                  });
+
+                  // Track latest YES-equivalent price
+                  latestPrice = isYes ? price : (1.0 - price);
+                }
+              }
+            }
+          });
+        }
       } catch (err) {
-        console.error("Error parsing Polymarket WS trade message:", err);
+        console.error("Error parsing WS trade message:", err);
       }
     };
 
     socket.onerror = (err) => {
-      console.error("Polymarket CLOB WebSocket Error:", err);
+      console.error("WebSocket Error:", err);
     };
 
     // Periodically flush accumulated trades and price updates to state once every 1000ms
@@ -352,7 +420,7 @@ export default function Home() {
         socket.close();
       }
     };
-  }, [status?.active_market?.yes_token_id, status?.active_market?.no_token_id]);
+  }, [status?.active_market?.yes_token_id, status?.active_market?.no_token_id, status?.struct_api_key]);
 
   // Handle bot config update
   const handleUpdateConfig = async (e: React.FormEvent) => {
@@ -442,7 +510,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          instrument: status?.runner_config.instrument || "EUR_USD",
+          instrument: status?.runner_config.instrument || "BTC_USD",
           units,
           price: currentPrice,
           stop_loss: Number(manualStopLoss),
@@ -464,6 +532,28 @@ export default function Home() {
       alert("Error sending order request.");
     }
   };
+  // Memoized chart computations — only recalculate when candles or config actually change,
+  // not on every mouse move or log update.
+  const chartEmaFast = status?.runner_config.ema_fast_period || 10;
+  const chartEmaSlow = status?.runner_config.ema_slow_period || 25;
+
+  const fastEmaVals = useMemo(
+    () => calculateEmaArray(candles.map(c => c.close), chartEmaFast),
+    [candles, chartEmaFast]
+  );
+  const slowEmaVals = useMemo(
+    () => calculateEmaArray(candles.map(c => c.close), chartEmaSlow),
+    [candles, chartEmaSlow]
+  );
+  const [chartMinPrice, chartMaxPrice] = useMemo(() => {
+    if (candles.length === 0) return [0, 0];
+    const lo = Math.min(...candles.map(c => c.low));
+    const hi = Math.max(...candles.map(c => c.high));
+    const spread = hi - lo;
+    return [lo - spread * 0.05, hi + spread * 0.05];
+  }, [candles]);
+  const maxVolume = useMemo(() => Math.max(...candles.map(c => c.volume)) || 1, [candles]);
+
   // SVG Chart Calculations
   const renderChart = () => {
     if (candles.length === 0) {
@@ -485,30 +575,18 @@ export default function Home() {
     const chartW = width - paddingLeft - paddingRight;
     const chartH = height - paddingTop - paddingBottom;
 
-    // Find min and max prices
-    let minPrice = Math.min(...candles.map(c => c.low));
-    let maxPrice = Math.max(...candles.map(c => c.high));
-
-    // Pad prices a bit
-    const spread = maxPrice - minPrice;
-    minPrice -= spread * 0.05;
-    maxPrice += spread * 0.05;
+    const minPrice = chartMinPrice;
+    const maxPrice = chartMaxPrice;
 
     // Mapping functions
     const xMap = (index: number) => paddingLeft + (index / (candles.length - 1)) * chartW;
     const yMap = (price: number) => height - paddingBottom - ((price - minPrice) / (maxPrice - minPrice)) * chartH;
 
-    // Calculate indicator EMAs locally for drawing overlay
-    const fastPeriod = status?.runner_config.ema_fast_period || 10;
-    const slowPeriod = status?.runner_config.ema_slow_period || 25;
-
-    const fastEmaVals = calculateEmaArray(candles.map(c => c.close), fastPeriod);
-    const slowEmaVals = calculateEmaArray(candles.map(c => c.close), slowPeriod);
+    const fastPeriod = chartEmaFast;
+    const slowPeriod = chartEmaSlow;
 
     const currentPrice = candles[candles.length - 1].close;
     const decimals = currentPrice > 1000 ? 2 : 5;
-
-    const maxVolume = Math.max(...candles.map(c => c.volume)) || 1;
 
     // Calculate price at mouse coordinate
     let hoverPrice = 0;
@@ -554,18 +632,27 @@ export default function Home() {
           viewBox={`0 0 ${width} ${height}`}
           className="overflow-visible cursor-crosshair select-none"
           onMouseMove={(e) => {
+            // RAF-throttle: skip if a frame update is already queued (limits to ~60fps max)
+            if (rafRef.current !== null) return;
             const rect = e.currentTarget.getBoundingClientRect();
-            const mouseX = ((e.clientX - rect.left) / rect.width) * width;
-            const mouseY = ((e.clientY - rect.top) / rect.height) * height;
-
-            let idx = Math.round(((mouseX - paddingLeft) / chartW) * (candles.length - 1));
-            if (idx < 0) idx = 0;
-            if (idx >= candles.length) idx = candles.length - 1;
-
-            setHoveredIndex(idx);
-            setMouseCoords({ x: mouseX, y: mouseY });
+            const clientX = e.clientX;
+            const clientY = e.clientY;
+            rafRef.current = requestAnimationFrame(() => {
+              const mouseX = ((clientX - rect.left) / rect.width) * width;
+              const mouseY = ((clientY - rect.top) / rect.height) * height;
+              let idx = Math.round(((mouseX - paddingLeft) / chartW) * (candles.length - 1));
+              if (idx < 0) idx = 0;
+              if (idx >= candles.length) idx = candles.length - 1;
+              setHoveredIndex(idx);
+              setMouseCoords({ x: mouseX, y: mouseY });
+              rafRef.current = null;
+            });
           }}
           onMouseLeave={() => {
+            if (rafRef.current !== null) {
+              cancelAnimationFrame(rafRef.current);
+              rafRef.current = null;
+            }
             setHoveredIndex(null);
             setMouseCoords(null);
           }}
@@ -1170,6 +1257,13 @@ export default function Home() {
                 <Sliders className="w-4 h-4 text-emerald-400" /> Manual Trading
               </h3>
 
+              {status?.mode === "polymarket" ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center py-8 text-slate-500 text-xs gap-2">
+                  <Sliders className="w-6 h-6 text-slate-700" />
+                  <span>Manual trading is disabled in Polymarket mode.</span>
+                  <span className="text-[10px] text-slate-600">The scalp strategy manages all entries automatically.</span>
+                </div>
+              ) : (
               <div className="flex flex-col gap-3.5 flex-1">
                 <div>
                   <label className="text-[10px] text-slate-400 block font-bold uppercase tracking-wider mb-1.5">Trade Size (Units)</label>
@@ -1221,6 +1315,7 @@ export default function Home() {
                   </button>
                 </div>
               </div>
+              )}
             </div>
           </div>
 
@@ -1444,7 +1539,9 @@ export default function Home() {
                         <div className="flex items-center gap-4 text-right">
                           <div>
                             <span className="font-mono text-slate-200 font-bold">${trade.price.toFixed(3)}</span>
-                            <span className="block text-[9px] text-slate-500 font-mono mt-0.5">{trade.size.toLocaleString()} shares</span>
+                            <span className="block text-[9px] text-slate-500 font-mono mt-0.5">
+                              {trade.size.toLocaleString()} shares {trade.usd_value !== undefined && `($${trade.usd_value.toFixed(2)} USDC)`}
+                            </span>
                           </div>
                           <span className="text-[9px] text-slate-500 font-mono">
                             {trade.timestamp}
@@ -1516,67 +1613,70 @@ export default function Home() {
             {/* Modal Body */}
             <div className="p-6 overflow-y-auto space-y-6 text-xs leading-relaxed text-slate-300">
               <div>
-                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">1. Operating Modes</h3>
+                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">1. What this bot does</h3>
                 <p className="mb-2">
-                  The bot supports two distinct operational frameworks, defined at startup via the backend environment:
+                  This is a latency-arbitrage <strong className="text-slate-200">scalper</strong> for Polymarket&rsquo;s 5-minute BTC up/down contracts. When BTC spot moves, the YES/NO token price briefly lags the move &mdash; the bot buys that lag and sells the catch-up, exiting in seconds. It never holds to settlement.
                 </p>
                 <ul className="list-disc pl-4 space-y-1.5 text-slate-400">
                   <li>
-                    <strong className="text-slate-200">Local Simulation:</strong> A risk-free paper trading environment. Uses an internal matching engine to track virtual balances and execute manual/automated orders. Trades, account balances, and historical performance are saved to the local SQLite database.
+                    <strong className="text-slate-200">Demo wallet:</strong> trades run against a simulated USDC wallet. Positions, transactions and performance are persisted to the local SQLite database.
                   </li>
                   <li>
-                    <strong className="text-slate-200">Oanda Live/Demo:</strong> Connects directly to Oanda broker endpoints. Orders, trades, and account balances are fetched and executed directly against Oanda’s REST v20 servers.
+                    <strong className="text-slate-200">Live data:</strong> BTC candles/spot feed the volatility model; the Polymarket (Struct) WebSocket streams real token trades for pricing and order-book depth.
                   </li>
                 </ul>
               </div>
 
               <div>
-                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">2. Automated Strategy Logic</h3>
+                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">2. Entry logic</h3>
                 <p className="mb-2">
-                  The automated trading loop runs in the background at a fixed 60-second ticker. It performs analysis and makes decisions based on:
+                  Each second the bot evaluates the active contract and only enters when <em>all</em> of these align:
                 </p>
                 <ul className="list-disc pl-4 space-y-1.5 text-slate-400">
                   <li>
-                    <strong className="text-slate-200">Technical Crossover:</strong> Looks for Fast EMA crossing over/under Slow EMA (indicates trend direction) filtered by the Relative Strength Index (RSI) to avoid entering oversold or overbought states.
+                    <strong className="text-slate-200">Mispricing edge:</strong> a Black-Scholes-style model turns BTC volatility into a fair YES/NO probability; it trades only when the token is mispriced by the edge threshold (the latency signal).
                   </li>
                   <li>
-                    <strong className="text-slate-200">Allora AI Signals (Optional):</strong> Queries the Allora Network for topic-specific price inferences. If <code className="text-emerald-400 font-mono">Use Allora AI</code> is checked, trades will only execute if the AI forecast aligns with the technical trend (e.g. bullish technicals + positive Allora inference).
+                    <strong className="text-slate-200">Spot lag:</strong> BTC must have moved at least <code className="text-indigo-400 font-mono">max(0.75 &times; ATR, $50)</code> from the contract&rsquo;s opening strike.
                   </li>
                   <li>
-                    <strong className="text-slate-200">Position Management:</strong> Reverses positions immediately if an opposite crossover signal occurs.
+                    <strong className="text-slate-200">Trend + window + liquidity:</strong> short-term EMA trend must agree with the side, entry is restricted to the 150&ndash;300s window of the contract, and the order book must have enough depth (fail-closed) to avoid slippage.
                   </li>
                 </ul>
               </div>
 
               <div>
-                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">3. Stop Loss (SL) & Take Profit (TP)</h3>
+                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">3. Exit logic (scalp)</h3>
                 <p className="mb-2">
-                  Risk management is structured differently for automated and manual orders:
+                  Positions are managed every second and on every live token trade:
                 </p>
                 <ul className="list-disc pl-4 space-y-1.5 text-slate-400">
                   <li>
-                    <strong className="text-slate-200">Automated Trades:</strong> Uses dynamic ATR-based boundaries. Stop Loss is set at <code className="text-indigo-400 font-mono">ATR * SL Multiplier</code>, and Take Profit is set at <code className="text-indigo-400 font-mono">ATR * TP Multiplier</code>. In simulation mode, the engine updates asset prices on every tick and automatically closes positions if the price hits these SL/TP barriers.
+                    <strong className="text-slate-200">Take profit:</strong> exits once the token reprices to entry + 60% of the entry edge &mdash; a fast, small catch-up profit.
                   </li>
                   <li>
-                    <strong className="text-slate-200">Manual Trades:</strong> You can enter custom SL/TP price levels directly in the Manual Trading ticket form. Setting these to <code className="text-slate-400 font-mono">0</code> disables SL/TP management for that order.
+                    <strong className="text-slate-200">Stop loss:</strong> entry &minus; $0.03, confirmed over 1 second on a noise-filtered price feed.
+                  </li>
+                  <li>
+                    <strong className="text-slate-200">Flatten:</strong> any open position is force-closed 90s before expiry, so a scalp never rides into the $0/$1 settlement gap.
                   </li>
                 </ul>
               </div>
 
               <div>
-                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">4. 24/7 Trading (BTC/USD) vs Closed Markets</h3>
+                <h3 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">4. Reading the dashboard</h3>
                 <p className="mb-2">
-                  Forex assets (like EUR/USD) only trade from Sunday evening through Friday afternoon. If the market is closed:
+                  Key panels to watch while the bot runs:
                 </p>
                 <ul className="list-disc pl-4 space-y-1.5 text-slate-400">
                   <li>
-                    Candle prices remain frozen at Friday's closing value.
+                    <strong className="text-slate-200">Latency Arbitrage</strong> card shows live win rate, W/L count and cumulative PnL for the scalp strategy.
                   </li>
                   <li>
-                    Floating P&L will remain static at <code className="text-slate-400 font-mono">+$0.00</code>.
+                    <strong className="text-slate-200">Polymarket Live Stream</strong> shows real YES/NO trade prints; the <strong className="text-slate-200">Console Logs</strong> show every entry/skip decision.
                   </li>
                   <li>
-                    To see active price movements, floating P&L fluctuations, and automatic SL/TP triggers in real-time, configure the system to trade <code className="text-emerald-400 font-mono">BTC_USD</code> (which trades continuously 24/7).
+                    Entries cluster around BTC moves &mdash; expect quiet stretches when spot sits near the strike and the lag filter holds the bot flat.
                   </li>
                 </ul>
               </div>
