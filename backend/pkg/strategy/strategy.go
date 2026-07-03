@@ -34,6 +34,7 @@ type Config struct {
 }
 
 type Runner struct {
+	cfgMu           sync.RWMutex
 	cfg             Config
 	store           *db.DB
 	oandaClient     *oanda.Client
@@ -57,6 +58,8 @@ func NewRunner(cfg Config, store *db.DB, oClient *oanda.Client, aClient interfac
 }
 
 func (r *Runner) GetConfig() Config {
+	r.cfgMu.RLock()
+	defer r.cfgMu.RUnlock()
 	return r.cfg
 }
 
@@ -67,13 +70,18 @@ func (r *Runner) GetLatestPolymarketInfo() *PolymarketMarketInfo {
 }
 
 func (r *Runner) UpdateConfig(newCfg Config) {
+	r.cfgMu.Lock()
 	r.cfg = newCfg
-	r.store.Log("INFO", fmt.Sprintf("Config updated: Instrument=%s, TradingEnabled=%t, UseAllora=%t", r.cfg.Instrument, r.cfg.TradingEnabled, r.cfg.UseAllora))
+	r.cfgMu.Unlock()
+	r.store.Log("INFO", fmt.Sprintf("Config updated: Instrument=%s, TradingEnabled=%t, UseAllora=%t", newCfg.Instrument, newCfg.TradingEnabled, newCfg.UseAllora))
 }
 
 // Tick executes a single strategy step
 func (r *Runner) Tick() error {
-	if !r.cfg.TradingEnabled {
+	r.cfgMu.RLock()
+	cfg := r.cfg
+	r.cfgMu.RUnlock()
+	if !cfg.TradingEnabled {
 		return nil
 	}
 
@@ -888,16 +896,19 @@ func fetchCoinGeckoCandles(symbol string, count int) ([]oanda.Candle, error) {
 // LiveTick fetches the real-time spot price frequently
 // to decouple live execution from the 5-minute candle evaluation.
 func (r *Runner) LiveTick() error {
-	if !r.cfg.TradingEnabled {
+	r.cfgMu.RLock()
+	cfg := r.cfg
+	r.cfgMu.RUnlock()
+	if !cfg.TradingEnabled {
 		return nil
 	}
-	instUpper := strings.ToUpper(r.cfg.Instrument)
+	instUpper := strings.ToUpper(cfg.Instrument)
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 	
 	if isCrypto {
-		livePrice, err := fetchLivePrice(r.cfg.Instrument)
+		livePrice, err := fetchLivePrice(cfg.Instrument)
 		if err == nil && livePrice > 0 {
-			r.engine.UpdatePrices(map[string]float64{r.cfg.Instrument: livePrice})
+			r.engine.UpdatePrices(map[string]float64{cfg.Instrument: livePrice})
 		}
 
 		// Polymarket prices are now updated in real-time via the CLOB WebSocket listener thread

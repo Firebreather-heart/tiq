@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"tiq/backend/pkg/db"
@@ -198,6 +199,13 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 
 	if req.PositionID == "" || req.CurrentPrice == 0 {
 		s.writeJSONError(w, http.StatusBadRequest, "Missing required parameters (position_id, current_price)")
+		return
+	}
+
+	// For Polymarket binary tokens, price must be within (0, 1).
+	// Reject out-of-range values to prevent manual balance manipulation.
+	if strings.HasPrefix(req.PositionID, "poly_") && (req.CurrentPrice < 0 || req.CurrentPrice > 1) {
+		s.writeJSONError(w, http.StatusBadRequest, "current_price must be between 0 and 1 for Polymarket positions")
 		return
 	}
 

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,7 +16,6 @@ import (
 	"io"
 	"math"
 	"math/big"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -97,7 +97,10 @@ func deriveOrFetchCredentials(key *ecdsa.PrivateKey, address string, sigType int
 }
 
 func fetchAPIKey(url string, headers map[string]string) (*polymarketCredentials, error) {
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build GET request: %w", err)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -128,7 +131,10 @@ func fetchAPIKey(url string, headers map[string]string) (*polymarketCredentials,
 }
 
 func createAPIKey(url string, headers map[string]string, body []byte) (*polymarketCredentials, error) {
-	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build POST request: %w", err)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -318,16 +324,31 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 		return "", fmt.Errorf("order too small: %.2f USDC at %.2f yields %.2f shares", usdcAmount, tickPrice, usdcAmount/tickPrice)
 	}
 
-	// Amounts in 6-decimal USDC
-	makerAmtRaw := new(big.Int).SetInt64(int64(math.Round(usdcAmount * 1e6)))
-	takerAmtRaw := new(big.Int).SetInt64(int64(shares * 1e6))
+	// Amounts in 6-decimal units.
+	// BUY:  maker gives USDC → receives shares.  makerAmt=USDC, takerAmt=shares.
+	// SELL: maker gives shares → receives USDC.  makerAmt=shares, takerAmt=USDC.
+	usdcRaw := new(big.Int).SetInt64(int64(math.Round(usdcAmount * 1e6)))
+	sharesRaw := new(big.Int).SetInt64(int64(shares * 1e6))
+	var makerAmtRaw, takerAmtRaw *big.Int
+	if side == 1 { // SELL
+		makerAmtRaw = sharesRaw
+		takerAmtRaw = usdcRaw
+	} else { // BUY
+		makerAmtRaw = usdcRaw
+		takerAmtRaw = sharesRaw
+	}
 
 	tokenBig, ok := new(big.Int).SetString(tokenID, 10)
 	if !ok {
 		return "", fmt.Errorf("invalid tokenID %q", tokenID)
 	}
 
-	salt := new(big.Int).SetInt64(rand.Int63())
+	// Use crypto/rand for salt — math/rand is deterministic and unsuitable for order security.
+	saltMax := new(big.Int).Lsh(big.NewInt(1), 128)
+	salt, err := crand.Int(crand.Reader, saltMax)
+	if err != nil {
+		return "", fmt.Errorf("generate order salt: %w", err)
+	}
 
 	// For Magic.link accounts: maker = funder (proxy wallet holding USDC),
 	// signer = EOA address derived from private key.
@@ -474,11 +495,13 @@ func (p *PolymarketEngine) resolveTokenForClose(units float64) string {
 // ABI / encoding helpers
 // ---------------------------------------------------------------------------
 
-// pad32 left-pads a big.Int to 32 bytes.
+// pad32 left-pads a big.Int to 32 bytes (ABI/EIP-712 uint256 encoding).
+// For values > 32 bytes (> 2^256) we take the least-significant 32 bytes — valid
+// EIP-712 fields are always ≤ 256 bits, so this path is a safety net only.
 func pad32(n *big.Int) []byte {
 	b := n.Bytes()
-	if len(b) >= 32 {
-		return b[:32]
+	if len(b) > 32 {
+		return b[len(b)-32:]
 	}
 	out := make([]byte, 32)
 	copy(out[32-len(b):], b)

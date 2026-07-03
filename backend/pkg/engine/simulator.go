@@ -17,6 +17,7 @@ type Simulator struct {
 	accountID string
 	prices    map[string]float64
 	mu        sync.RWMutex
+	accountMu sync.Mutex // serialises balance mutations (prevents double-close double-credit)
 }
 
 func NewSimulator(store *db.DB, initialBalance float64) (*Simulator, error) {
@@ -178,13 +179,16 @@ func (s *Simulator) OpenPosition(instrument string, units float64, currentPrice 
 }
 
 func (s *Simulator) ClosePosition(id string, currentPrice float64) error {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+
 	pos, err := s.store.GetPosition(id)
 	if err != nil {
 		return err
 	}
 
 	if pos.Status == "CLOSED" {
-		return fmt.Errorf("position already closed")
+		return nil // already closed — no-op, not an error
 	}
 
 	acc, err := s.store.GetAccount(s.accountID)

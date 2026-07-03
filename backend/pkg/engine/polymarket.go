@@ -1,7 +1,9 @@
 package engine
 
 import (
+	crand "crypto/rand"
 	"crypto/ecdsa"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -303,8 +305,10 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 	acc.UpdatedAt = time.Now()
 	_ = p.store.SaveAccount(acc)
 
-	// Save position to local DB
-	posID := fmt.Sprintf("poly_%d", time.Now().UnixNano())
+	// Save position to local DB (nanotime + 4 random bytes = collision-proof ID)
+	randSuffix := make([]byte, 4)
+	_, _ = crand.Read(randSuffix)
+	posID := fmt.Sprintf("poly_%d_%s", time.Now().UnixNano(), hex.EncodeToString(randSuffix))
 	pos := db.Position{
 		ID:          posID,
 		Instrument:  market,
@@ -366,17 +370,21 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 	pnl := math.Abs(pos.Units) * (currentPrice - pos.OpenPrice)
 
 	if p.liveTrading {
-		// Submit real SELL order to Polymarket CLOB
 		tokenID := p.resolveTokenForClose(pos.Units)
-		if tokenID != "" {
-			_, sellErr := p.submitLiveSellOrder(tokenID, currentPrice, math.Abs(pos.Units))
-			if sellErr != nil {
-				p.store.Log("WARN", fmt.Sprintf("[CLOB] Sell order for %s failed: %v — position closed locally only.", id, sellErr))
-			} else {
-				p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE sell order filled. Token: %s | Price: $%.2f | Shares: %.2f",
-					tokenID[:8]+"...", currentPrice, math.Abs(pos.Units)))
-			}
+		if tokenID == "" {
+			// Token IDs not yet known (e.g. mid-restart). Keep position OPEN to avoid
+			// inflating local balance for a sell that never happened on-chain.
+			p.store.Log("ERROR", fmt.Sprintf("[CLOB] Cannot sell %s: token IDs unknown (WS not yet subscribed). Position kept OPEN.", id))
+			return fmt.Errorf("CLOB sell skipped: token IDs unavailable for %s", id)
 		}
+		_, sellErr := p.submitLiveSellOrder(tokenID, currentPrice, math.Abs(pos.Units))
+		if sellErr != nil {
+			// CRITICAL: do NOT close locally — that would inflate the balance with USDC we never received.
+			p.store.Log("ERROR", fmt.Sprintf("[CLOB] SELL order for %s FAILED: %v — position kept OPEN to prevent balance inflation.", id, sellErr))
+			return fmt.Errorf("CLOB sell failed: %w", sellErr)
+		}
+		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE sell filled. Token: %s | Price: $%.2f | Shares: %.2f",
+			tokenID[:8]+"...", currentPrice, math.Abs(pos.Units)))
 	}
 
 	// Refund balance + returns to Web3 wallet (local tracker)
@@ -661,7 +669,9 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		// so the realized loss is capped at the defined risk even on gap-downs.
 		slTrigger := pos.StopLoss
 		if slTrigger <= 0 {
-			slTrigger = pos.OpenPrice
+			// No valid SL configured — skip rather than defaulting to OpenPrice,
+			// which would trigger an immediate close on any tiny pullback.
+			goto checkTP
 		}
 
 		if slPrice <= slTrigger {
@@ -674,6 +684,7 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		}
 
 		// 3. Take Profit check: if current token price meets or exceeds target predicted probability, sell/exit early to lock in profits
+		checkTP:
 		if pos.TakeProfit > 0 && price >= pos.TakeProfit {
 			p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Take Profit triggered (Current Share Price: $%.2f >= Predicted Target: $%.2f). Locking in profit.", price, pos.TakeProfit))
 			p.mu.Lock()

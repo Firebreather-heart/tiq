@@ -157,7 +157,7 @@ func main() {
 
 		for range liveTicker.C {
 			if err := runner.LiveTick(); err != nil {
-				// Silently handle to prevent spamming logs
+				store.Log("WARN", fmt.Sprintf("LiveTick error (price feed may be stale): %v", err))
 			}
 		}
 	}()
