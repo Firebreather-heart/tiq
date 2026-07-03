@@ -17,10 +17,65 @@ import (
 	"tiq/backend/pkg/db"
 )
 
+// structKeyManager rotates through Struct API keys on consecutive failures.
+// After 3 consecutive errors on the active key it promotes the next key in the list.
+type structKeyManager struct {
+	keys      []string
+	activeIdx int
+	errCount  int
+	mu        sync.Mutex
+}
+
+func newStructKeyManager() *structKeyManager {
+	var keys []string
+	if k := os.Getenv("STRUCT_API_KEY"); k != "" {
+		keys = append(keys, k)
+	}
+	if k := os.Getenv("STRUCT_API_KEY_2"); k != "" {
+		keys = append(keys, k)
+	}
+	return &structKeyManager{keys: keys}
+}
+
+func (m *structKeyManager) current() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.keys) == 0 {
+		return ""
+	}
+	return m.keys[m.activeIdx]
+}
+
+// reportError increments the consecutive-error counter and rotates to the next key if the
+// threshold is reached. Returns the new active key (empty if no keys configured).
+func (m *structKeyManager) reportError(logFn func(string, string)) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.keys) == 0 {
+		return ""
+	}
+	m.errCount++
+	if m.errCount >= 3 && len(m.keys) > 1 {
+		prev := m.activeIdx + 1
+		m.activeIdx = (m.activeIdx + 1) % len(m.keys)
+		m.errCount = 0
+		logFn("WARN", fmt.Sprintf("[Struct Key Manager] Key #%d hit 3 consecutive errors — rotating to key #%d.", prev, m.activeIdx+1))
+	}
+	return m.keys[m.activeIdx]
+}
+
+func (m *structKeyManager) reportSuccess() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.errCount = 0
+}
+
 type PolymarketEngine struct {
 	store               *db.DB
 	walletAddress       string
 	privateKey          *ecdsa.PrivateKey
+	creds               *polymarketCredentials // non-nil when POLY_LIVE=true
+	liveTrading         bool                   // true when POLY_LIVE=true and credentials loaded
 	prices              map[string]float64
 	slPrices            map[string]float64   // Separate price feed for SL checking, only updated by trades >= $20 USDC
 	slPriceTimes        map[string]time.Time // Last update time of each slPrices entry (for staleness fallback)
@@ -35,38 +90,83 @@ type PolymarketEngine struct {
 	mu                  sync.RWMutex
 	accountMu           sync.Mutex // Serializes wallet balance + position open/close (prevents double-close/double-refund races)
 	structMu            sync.Mutex // Protects structConn lifecycle (connect on OpenPosition, close on ClosePosition)
+	keyMgr              *structKeyManager
 }
 
 func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*PolymarketEngine, error) {
-	// For simulation / development, we seed the wallet address from mock hex
-	walletAddr := "0x71C7656EC7ab88b098defB751B7401B5f6d1476B"
-	
-	// Create default Web3 wallet balance if not exists (USDC on Polygon)
-	accID := "polymarket_wallet_" + walletAddr
-	_, err := store.GetAccount(accID)
+	// Attempt to load live credentials first. Falls back to paper mode if POLY_LIVE != "true".
+	privKey, walletAddr, creds, err := loadLiveCredentials()
 	if err != nil {
+		return nil, fmt.Errorf("live credential setup failed: %w", err)
+	}
+
+	isLive := creds != nil
+	environment := "demo"
+	if isLive {
+		environment = "live"
+		store.Log("INFO", fmt.Sprintf("[Polymarket Engine] LIVE MODE active. Wallet: %s", walletAddr))
+	} else {
+		// Paper mode: use a deterministic mock address
+		walletAddr = "0x71C7656EC7ab88b098defB751B7401B5f6d1476B"
+		store.Log("INFO", "[Polymarket Engine] PAPER MODE (set POLY_LIVE=true to enable live trading).")
+	}
+
+	// Initialize local wallet account for balance tracking
+	accID := "polymarket_wallet_" + walletAddr
+	_, err = store.GetAccount(accID)
+	if err != nil {
+		startBal := 100.00
+		if isLive {
+			startBal = 0 // Will be synced from CLOB balance on first GetBalance call
+		}
 		err = store.SaveAccount(db.Account{
 			ID:          accID,
-			Environment: "demo",
-			Balance:     100.00,
+			Environment: environment,
+			Balance:     startBal,
 			Currency:    "USDC",
 			UpdatedAt:   time.Now(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize Polymarket wallet account: %w", err)
 		}
-		store.Log("INFO", fmt.Sprintf("Web3 Polymarket Wallet initialized. Address: %s, USDC Balance: $100.00", walletAddr))
+		store.Log("INFO", fmt.Sprintf("Web3 Polymarket Wallet initialized. Address: %s", walletAddr))
+	}
+
+	km := newStructKeyManager()
+	if len(km.keys) == 0 {
+		store.Log("WARN", "[Struct Key Manager] No STRUCT_API_KEY configured — liquidity checks will fail-open.")
+	} else {
+		store.Log("INFO", fmt.Sprintf("[Struct Key Manager] Loaded %d API key(s).", len(km.keys)))
 	}
 
 	engine := &PolymarketEngine{
 		store:         store,
 		walletAddress: walletAddr,
+		privateKey:    privKey,
+		creds:         creds,
+		liveTrading:   isLive,
 		prices:        make(map[string]float64),
 		slPrices:      make(map[string]float64),
 		slPriceTimes:  make(map[string]time.Time),
 		slStates:      make(map[string]time.Time),
 		rpcURL:        rpcURL,
 		clobURL:       "https://clob.polymarket.com",
+		keyMgr:        km,
+	}
+
+	// Sync real CLOB balance on startup (live only)
+	if isLive {
+		if bal, err := engine.getCLOBBalance(); err == nil {
+			accID := "polymarket_wallet_" + walletAddr
+			if acc, err := store.GetAccount(accID); err == nil {
+				acc.Balance = bal
+				acc.UpdatedAt = time.Now()
+				_ = store.SaveAccount(acc)
+				store.Log("INFO", fmt.Sprintf("[Polymarket Engine] CLOB balance synced: $%.2f USDC", bal))
+			}
+		} else {
+			store.Log("WARN", fmt.Sprintf("[Polymarket Engine] Could not sync CLOB balance: %v", err))
+		}
 	}
 
 	// Start the real-time WebSocket connection to Polymarket CLOB
@@ -170,10 +270,25 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 		return "", fmt.Errorf("insufficient USDC balance in Web3 wallet: have %.2f, need %.2f", acc.Balance, cost)
 	}
 
-	// 1. Simulate EIP-712 Order signature
-	p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] Signed EIP-712 buy order for %s outcome. Wallet: %s", market, p.walletAddress))
+	// Determine which token we're buying
+	tokenID := yToken
+	if units < 0 {
+		tokenID = nToken
+	}
 
-	// Deduct USDC from wallet balance
+	if p.liveTrading {
+		// Submit real FOK buy order to Polymarket CLOB
+		orderID, err := p.submitLiveBuyOrder(tokenID, currentPrice, cost)
+		if err != nil {
+			return "", fmt.Errorf("[CLOB] Buy order failed: %w", err)
+		}
+		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE buy order filled. OrderID: %s | Token: %s | Price: $%.2f | USDC: $%.2f",
+			orderID, tokenID[:8]+"...", currentPrice, cost))
+	} else {
+		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] Signed EIP-712 buy order for %s outcome. Wallet: %s", market, p.walletAddress))
+	}
+
+	// Deduct USDC from local balance tracker (both live and paper)
 	acc.Balance -= cost
 	acc.UpdatedAt = time.Now()
 	_ = p.store.SaveAccount(acc)
@@ -214,7 +329,7 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 
 	// Connect Struct WS for reliable TP/SL price monitoring during this position.
 	// CLOB WS remains active as the background feed; Struct overrides prices while connected.
-	if os.Getenv("STRUCT_API_KEY") != "" && yToken != "" && nToken != "" {
+	if p.keyMgr.current() != "" && yToken != "" && nToken != "" {
 		go p.startStructPositionFeed(yToken, nToken)
 	}
 
@@ -240,7 +355,21 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 	// Payout is $1.00 USDC per share if won, but if sold back to order book early, we receive currentPrice
 	pnl := math.Abs(pos.Units) * (currentPrice - pos.OpenPrice)
 
-	// Refund balance + returns to Web3 wallet
+	if p.liveTrading {
+		// Submit real SELL order to Polymarket CLOB
+		tokenID := p.resolveTokenForClose(pos.Units)
+		if tokenID != "" {
+			_, sellErr := p.submitLiveSellOrder(tokenID, currentPrice, math.Abs(pos.Units))
+			if sellErr != nil {
+				p.store.Log("WARN", fmt.Sprintf("[CLOB] Sell order for %s failed: %v — position closed locally only.", id, sellErr))
+			} else {
+				p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE sell order filled. Token: %s | Price: $%.2f | Shares: %.2f",
+					tokenID[:8]+"...", currentPrice, math.Abs(pos.Units)))
+			}
+		}
+	}
+
+	// Refund balance + returns to Web3 wallet (local tracker)
 	accID := "polymarket_wallet_" + p.walletAddress
 	acc, err := p.store.GetAccount(accID)
 	if err == nil {
@@ -297,6 +426,9 @@ func (p *PolymarketEngine) UpdatePrices(prices map[string]float64) error {
 }
 
 func (p *PolymarketEngine) GetEnvironment() string {
+	if p.liveTrading {
+		return "live"
+	}
 	return "demo"
 }
 
@@ -325,10 +457,9 @@ func (p *PolymarketEngine) CheckOrderBookLiquidity(isYes bool, requiredUsdc floa
 		tokenID = noToken
 	}
 
-	apiKey := os.Getenv("STRUCT_API_KEY")
+	apiKey := p.keyMgr.current()
 	if apiKey == "" {
-		// No data source configured — fail-open so sim/dev without Struct still trades.
-		p.store.Log("WARN", "[Polymarket Engine] STRUCT_API_KEY not set — liquidity depth UNVERIFIED, allowing entry (fail-open). Set the key to enforce depth checks.")
+		p.store.Log("WARN", "[Polymarket Engine] No STRUCT_API_KEY configured — liquidity depth UNVERIFIED, allowing entry (fail-open).")
 		return true, nil
 	}
 
@@ -348,13 +479,15 @@ func (p *PolymarketEngine) CheckOrderBookLiquidity(isYes bool, requiredUsdc floa
 
 	resp, err := client.Do(req)
 	if err != nil {
+		p.keyMgr.reportError(p.store.Log)
 		p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] Struct order-book call failed: %v. Skipping entry (fail-closed).", err))
 		return false, nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] Struct order-book returned status %d. Skipping entry (fail-closed).", resp.StatusCode))
+		p.keyMgr.reportError(p.store.Log)
+		p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] Struct order-book returned HTTP %d. Skipping entry (fail-closed).", resp.StatusCode))
 		return false, nil
 	}
 
@@ -368,9 +501,13 @@ func (p *PolymarketEngine) CheckOrderBookLiquidity(isYes bool, requiredUsdc floa
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&ob); err != nil {
+		p.keyMgr.reportError(p.store.Log)
 		p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] Failed to decode order book JSON: %v. Skipping entry (fail-closed).", err))
 		return false, nil
 	}
+
+	// Successful API round-trip — reset error counter.
+	p.keyMgr.reportSuccess()
 
 	if !ob.Success || ob.Data.AskLiquidityUsd == nil {
 		p.store.Log("INFO", "[Polymarket Engine] No ask-side liquidity reported (empty book). Skipping entry (fail-closed).")
@@ -506,38 +643,24 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 			slPrice = 1.0 - slYesPrice
 		}
 
-		// 2. Stop Loss check: if robust share price meets or drops below stop-loss trigger price, start confirmation timer
+		// 2. Stop Loss check: close immediately when price breaches the trigger.
+		// No confirmation timer — a 3-cent scalp stop has no room for delay; waiting
+		// 1 second on a fast binary token means closing $0.10-$0.40 below the intended
+		// trigger, turning a $0.30 controlled loss into a $1-2 loss.
+		// Close at slTrigger (the intended stop price), not slPrice (current price),
+		// so the realized loss is capped at the defined risk even on gap-downs.
 		slTrigger := pos.StopLoss
 		if slTrigger <= 0 {
 			slTrigger = pos.OpenPrice
 		}
 
 		if slPrice <= slTrigger {
+			p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Stop Loss triggered (Price: $%.4f <= Trigger: $%.4f). Closing at SL trigger price.", slPrice, slTrigger))
 			p.mu.Lock()
-			breachTime, breached := p.slStates[pos.ID]
-			if !breached {
-				breachTime = time.Now()
-				p.slStates[pos.ID] = breachTime
-				p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Stop Loss threshold breached (Robust Price: $%.2f <= Trigger: $%.2f). Starting 1-second validation timer...", slPrice, slTrigger))
-			}
+			delete(p.slStates, pos.ID)
 			p.mu.Unlock()
-
-			if time.Since(breachTime) >= 1*time.Second {
-				p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Stop Loss confirmed after 1 second (Robust Price: $%.2f <= Trigger: $%.2f). Closing early.", slPrice, slTrigger))
-				p.mu.Lock()
-				delete(p.slStates, pos.ID)
-				p.mu.Unlock()
-				_ = p.ClosePosition(pos.ID, slPrice)
-				continue
-			}
-		} else {
-			// Reset confirmation timer if price recovers above SL trigger
-			p.mu.Lock()
-			if _, breached := p.slStates[pos.ID]; breached {
-				p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Price recovered above Stop Loss (Robust Price: $%.2f > Trigger: $%.2f). Resetting confirmation timer.", slPrice, slTrigger))
-				delete(p.slStates, pos.ID)
-			}
-			p.mu.Unlock()
+			_ = p.ClosePosition(pos.ID, slTrigger)
+			continue
 		}
 
 		// 3. Take Profit check: if current token price meets or exceeds target predicted probability, sell/exit early to lock in profits
@@ -784,7 +907,7 @@ func (p *PolymarketEngine) handleWSMessage(msg []byte) {
 // compensating for occasional CLOB WS lag or drops that can delay exits mid-trade.
 // The goroutine exits cleanly when ClosePosition closes p.structConn.
 func (p *PolymarketEngine) startStructPositionFeed(yesToken, noToken string) {
-	apiKey := os.Getenv("STRUCT_API_KEY")
+	apiKey := p.keyMgr.current()
 	if apiKey == "" {
 		return
 	}
@@ -792,9 +915,11 @@ func (p *PolymarketEngine) startStructPositionFeed(yesToken, noToken string) {
 	wsURL := fmt.Sprintf("wss://api.struct.to/ws?api-key=%s", apiKey)
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
+		p.keyMgr.reportError(p.store.Log)
 		p.store.Log("WARN", fmt.Sprintf("[Struct Position Feed] Connect failed: %v. CLOB feed remains sole monitor.", err))
 		return
 	}
+	p.keyMgr.reportSuccess()
 
 	// Register; close any stale connection from a prior position that wasn't cleaned up.
 	p.structMu.Lock()

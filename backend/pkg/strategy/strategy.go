@@ -211,7 +211,7 @@ func (r *Runner) Tick() error {
 			MarketAddress:    marketAddr,
 			StrikePrice:      strike,
 			ExpirationTime:   expiration,
-			MinExpectedValue: 0.05,
+			MinExpectedValue: 0.12,
 			RiskPercent:      r.cfg.RiskPercent,
 		}
 		
