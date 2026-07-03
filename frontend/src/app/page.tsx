@@ -1079,8 +1079,8 @@ export default function Home() {
               <div>
                 <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Bot Environment</p>
                 <h3 className="text-sm font-black text-slate-100 mt-2 font-mono flex items-center gap-1.5">
-                  <span className="inline-block w-2.5 h-2.5 rounded-full bg-indigo-500 shadow-lg shadow-indigo-500/50" />
-                  {status?.environment === "real" ? "OANDA DEMO/REAL" : "LOCAL SIMULATION"}
+                  <span className={`inline-block w-2.5 h-2.5 rounded-full shadow-lg ${status?.environment === "live" ? "bg-emerald-400 shadow-emerald-500/50 animate-pulse" : "bg-indigo-500 shadow-indigo-500/50"}`} />
+                  {status?.environment === "live" ? "POLYMARKET LIVE" : status?.environment === "real" ? "OANDA DEMO/REAL" : "LOCAL SIMULATION"}
                 </h3>
               </div>
               <div className="text-purple-500 bg-purple-500/10 p-2.5 rounded-xl border border-purple-500/20">
@@ -1183,7 +1183,7 @@ export default function Home() {
                     </thead>
                     <tbody>
                       {positions.map((pos) => {
-                        const isPolymarket = pos.instrument.startsWith("poly_");
+                        const isPolymarket = pos.id.startsWith("poly_");
                         const isLong = pos.units > 0;
                         const isMatchingInstrument = isPolymarket
                           ? (status?.active_market && pos.instrument.includes(status.active_market.market_id))
