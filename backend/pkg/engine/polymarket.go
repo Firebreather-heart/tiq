@@ -72,7 +72,8 @@ func (m *structKeyManager) reportSuccess() {
 
 type PolymarketEngine struct {
 	store               *db.DB
-	walletAddress       string
+	walletAddress       string // signer EOA address (derived from private key)
+	funderAddress       string // Magic.link proxy wallet (holds USDC); empty for EOA accounts
 	privateKey          *ecdsa.PrivateKey
 	creds               *polymarketCredentials // non-nil when POLY_LIVE=true
 	liveTrading         bool                   // true when POLY_LIVE=true and credentials loaded
@@ -95,19 +96,27 @@ type PolymarketEngine struct {
 
 func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*PolymarketEngine, error) {
 	// Attempt to load live credentials first. Falls back to paper mode if POLY_LIVE != "true".
-	privKey, walletAddr, creds, err := loadLiveCredentials()
+	privKey, signerAddr, funderAddr, creds, err := loadLiveCredentials()
 	if err != nil {
 		return nil, fmt.Errorf("live credential setup failed: %w", err)
 	}
 
 	isLive := creds != nil
 	environment := "demo"
+
+	// walletAddr is used as the DB account key. In live mode use funder (real USDC wallet);
+	// fall back to signer if POLY_FUNDER_ADDRESS wasn't set.
+	walletAddr := signerAddr
 	if isLive {
 		environment = "live"
-		store.Log("INFO", fmt.Sprintf("[Polymarket Engine] LIVE MODE active. Wallet: %s", walletAddr))
+		if funderAddr != "" {
+			walletAddr = funderAddr
+		}
+		store.Log("INFO", fmt.Sprintf("[Polymarket Engine] LIVE MODE active. Funder: %s | Signer: %s", walletAddr, signerAddr))
 	} else {
 		// Paper mode: use a deterministic mock address
 		walletAddr = "0x71C7656EC7ab88b098defB751B7401B5f6d1476B"
+		signerAddr = walletAddr
 		store.Log("INFO", "[Polymarket Engine] PAPER MODE (set POLY_LIVE=true to enable live trading).")
 	}
 
@@ -141,7 +150,8 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 
 	engine := &PolymarketEngine{
 		store:         store,
-		walletAddress: walletAddr,
+		walletAddress: signerAddr, // signer EOA (signs orders, L1/L2 auth)
+		funderAddress: funderAddr, // proxy wallet (holds USDC, set as maker in orders)
 		privateKey:    privKey,
 		creds:         creds,
 		liveTrading:   isLive,
@@ -186,7 +196,7 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 }
 
 func (p *PolymarketEngine) GetBalance() (float64, float64, error) {
-	accID := "polymarket_wallet_" + p.walletAddress
+	accID := "polymarket_wallet_" + p.accountKey()
 	acc, err := p.store.GetAccount(accID)
 	if err != nil {
 		return 0, 0, err
@@ -259,7 +269,7 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 	p.accountMu.Lock()
 	defer p.accountMu.Unlock()
 
-	accID := "polymarket_wallet_" + p.walletAddress
+	accID := "polymarket_wallet_" + p.accountKey()
 	acc, err := p.store.GetAccount(accID)
 	if err != nil {
 		return "", err
@@ -370,7 +380,7 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 	}
 
 	// Refund balance + returns to Web3 wallet (local tracker)
-	accID := "polymarket_wallet_" + p.walletAddress
+	accID := "polymarket_wallet_" + p.accountKey()
 	acc, err := p.store.GetAccount(accID)
 	if err == nil {
 		payoutAmount := math.Abs(pos.Units) * currentPrice
@@ -675,6 +685,15 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 	}
 
 	return nil
+}
+
+// accountKey returns the address used as the local DB account identifier.
+// In live mode this is the funder (proxy wallet that holds USDC); in paper mode it's the mock address.
+func (p *PolymarketEngine) accountKey() string {
+	if p.funderAddress != "" {
+		return p.funderAddress
+	}
+	return p.walletAddress
 }
 
 // Utility helper

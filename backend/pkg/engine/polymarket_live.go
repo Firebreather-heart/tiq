@@ -37,10 +37,11 @@ const (
 )
 
 type polymarketCredentials struct {
-	address     string
-	apiKey      string
-	secret      string
-	passphrase  string
+	signerAddress string // EOA address derived from private key — signs orders
+	funderAddress string // proxy wallet address — holds USDC, set as maker in orders
+	apiKey        string
+	secret        string
+	passphrase    string
 	signatureType int // 0=EOA/MetaMask, 1=Magic.link
 }
 
@@ -78,7 +79,7 @@ func deriveOrFetchCredentials(key *ecdsa.PrivateKey, address string, sigType int
 	// Try GET first (returns existing key if already created)
 	creds, err := fetchAPIKey(clobBase+"/auth/api-key", headers)
 	if err == nil {
-		creds.address = address
+		creds.signerAddress = address
 		creds.signatureType = sigType
 		return creds, nil
 	}
@@ -90,7 +91,7 @@ func deriveOrFetchCredentials(key *ecdsa.PrivateKey, address string, sigType int
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Polymarket API key: %w", err)
 	}
-	creds.address = address
+	creds.signerAddress = address
 	creds.signatureType = sigType
 	return creds, nil
 }
@@ -171,6 +172,7 @@ func personalSign(msg []byte, key *ecdsa.PrivateKey) (string, error) {
 }
 
 // buildL2Headers constructs the HMAC-SHA256 authentication headers for L2 auth.
+// POLY_ADDRESS is the signer (EOA) address — the CLOB ties API keys to the signer, not the funder.
 func buildL2Headers(creds *polymarketCredentials, method, path, body string) map[string]string {
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 	msg := ts + strings.ToUpper(method) + path + body
@@ -178,7 +180,7 @@ func buildL2Headers(creds *polymarketCredentials, method, path, body string) map
 	mac.Write([]byte(msg))
 	sig := hex.EncodeToString(mac.Sum(nil))
 	return map[string]string{
-		"POLY_ADDRESS":    creds.address,
+		"POLY_ADDRESS":    creds.signerAddress,
 		"POLY_API_KEY":    creds.apiKey,
 		"POLY_PASSPHRASE": creds.passphrase,
 		"POLY_TIMESTAMP":  ts,
@@ -327,10 +329,18 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 
 	salt := new(big.Int).SetInt64(rand.Int63())
 
+	// For Magic.link accounts: maker = funder (proxy wallet holding USDC),
+	// signer = EOA address derived from private key.
+	// For EOA accounts: maker = signer = walletAddress.
+	makerAddr := p.walletAddress
+	if p.funderAddress != "" {
+		makerAddr = p.funderAddress
+	}
+
 	sigType := uint8(p.creds.signatureType)
 	order := clobOrder{
 		Salt:          salt,
-		Maker:         p.walletAddress,
+		Maker:         makerAddr,
 		Signer:        p.walletAddress,
 		Taker:         "0x0000000000000000000000000000000000000000",
 		TokenID:       tokenBig,
@@ -351,7 +361,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 	payload := clobOrderRequest{
 		Order: clobOrderJSON{
 			Salt:          salt.String(),
-			Maker:         p.walletAddress,
+			Maker:         makerAddr,
 			Signer:        p.walletAddress,
 			Taker:         "0x0000000000000000000000000000000000000000",
 			TokenID:       tokenID,
@@ -364,7 +374,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 			SignatureType: p.creds.signatureType,
 			Signature:     sig,
 		},
-		Owner:     p.walletAddress,
+		Owner:     makerAddr,
 		OrderType: "FOK",
 	}
 
@@ -506,31 +516,36 @@ func concat(parts ...[]byte) []byte {
 }
 
 // loadLiveCredentials reads POLY_PRIVATE_KEY from env and derives API credentials.
-// Returns nil, nil when POLY_LIVE != "true" (paper mode).
-func loadLiveCredentials() (*ecdsa.PrivateKey, string, *polymarketCredentials, error) {
+// Returns nil, "", nil, nil when POLY_LIVE != "true" (paper mode).
+// signerAddr is the EOA address derived from the private key.
+// funderAddr is POLY_FUNDER_ADDRESS (the Magic.link proxy wallet); empty for EOA accounts.
+func loadLiveCredentials() (key *ecdsa.PrivateKey, signerAddr, funderAddr string, creds *polymarketCredentials, err error) {
 	if os.Getenv("POLY_LIVE") != "true" {
-		return nil, "", nil, nil
+		return nil, "", "", nil, nil
 	}
 	privHex := os.Getenv("POLY_PRIVATE_KEY")
 	if privHex == "" {
-		return nil, "", nil, fmt.Errorf("POLY_LIVE=true but POLY_PRIVATE_KEY is not set")
+		return nil, "", "", nil, fmt.Errorf("POLY_LIVE=true but POLY_PRIVATE_KEY is not set")
 	}
 
-	key, addr, err := loadPrivateKey(privHex)
+	key, signerAddr, err = loadPrivateKey(privHex)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
+
+	funderAddr = os.Getenv("POLY_FUNDER_ADDRESS")
 
 	sigType := 0
 	if os.Getenv("POLY_SIGNATURE_TYPE") == "1" {
 		sigType = 1
 	}
 
-	creds, err := deriveOrFetchCredentials(key, addr, sigType)
+	creds, err = deriveOrFetchCredentials(key, signerAddr, sigType)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("derive API credentials: %w", err)
+		return nil, "", "", nil, fmt.Errorf("derive API credentials: %w", err)
 	}
+	creds.funderAddress = funderAddr
 
-	return key, addr, creds, nil
+	return key, signerAddr, funderAddr, creds, nil
 }
 
