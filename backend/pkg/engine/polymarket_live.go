@@ -10,6 +10,7 @@ import (
 	"crypto/hmac"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -58,42 +59,81 @@ func loadPrivateKey(hexKey string) (*ecdsa.PrivateKey, string, error) {
 
 // deriveOrFetchCredentials obtains Polymarket L2 API credentials.
 // It calls GET /auth/api-key first; if none exist it creates them via POST.
-func deriveOrFetchCredentials(key *ecdsa.PrivateKey, address string, sigType int) (*polymarketCredentials, error) {
+//
+// L1 auth uses an EIP-712 typed signature of the ClobAuth struct (matching the
+// official py-clob-client), NOT a personal_sign of the timestamp. POLY_ADDRESS
+// is always the EOA signer address — API keys are bound to the signing key;
+// the funder/proxy wallet only appears later in order payloads.
+func deriveOrFetchCredentials(key *ecdsa.PrivateKey, signerAddr, funderAddr string, sigType int) (*polymarketCredentials, error) {
 	const clobBase = "https://clob.polymarket.com"
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 
-	// Build L1 auth headers (personal_sign of timestamp)
-	sig, err := personalSign([]byte(ts), key)
+	sig, err := signClobAuth(key, signerAddr, ts, 0)
 	if err != nil {
 		return nil, fmt.Errorf("L1 sign failed: %w", err)
 	}
 
 	headers := map[string]string{
-		"POLY_ADDRESS":        address,
-		"POLY_SIGNATURE":      sig,
-		"POLY_TIMESTAMP":      ts,
-		"POLY_NONCE":          "0",
-		"Content-Type":        "application/json",
+		"POLY_ADDRESS":   signerAddr,
+		"POLY_SIGNATURE": sig,
+		"POLY_TIMESTAMP": ts,
+		"POLY_NONCE":     "0",
+		"Content-Type":   "application/json",
 	}
 
 	// Try GET first (returns existing key if already created)
-	creds, err := fetchAPIKey(clobBase+"/auth/api-key", headers)
+	creds, err := fetchAPIKey(clobBase+"/auth/derive-api-key", headers)
 	if err == nil {
-		creds.signerAddress = address
+		creds.signerAddress = signerAddr
 		creds.signatureType = sigType
 		return creds, nil
 	}
 
 	// Create new API key
-	body := map[string]interface{}{"geo_block_token": ""}
-	bodyBytes, _ := json.Marshal(body)
-	creds, err = createAPIKey(clobBase+"/auth/api-key", headers, bodyBytes)
+	creds, err = createAPIKey(clobBase+"/auth/api-key", headers, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Polymarket API key: %w", err)
 	}
-	creds.signerAddress = address
+	creds.signerAddress = signerAddr
 	creds.signatureType = sigType
 	return creds, nil
+}
+
+// signClobAuth builds the EIP-712 ClobAuth attestation signature Polymarket's
+// /auth endpoints require:
+//
+//	domain: { name: "ClobAuthDomain", version: "1", chainId: 137 }  (no verifyingContract)
+//	ClobAuth(address address,string timestamp,uint256 nonce,string message)
+//	message: "This message attests that I control the given wallet"
+func signClobAuth(key *ecdsa.PrivateKey, address, timestamp string, nonce int64) (string, error) {
+	domainTypeHash := gethcrypto.Keccak256([]byte(
+		"EIP712Domain(string name,string version,uint256 chainId)",
+	))
+	domainSep := gethcrypto.Keccak256(concat(
+		domainTypeHash,
+		gethcrypto.Keccak256([]byte("ClobAuthDomain")),
+		gethcrypto.Keccak256([]byte("1")),
+		pad32(big.NewInt(polyChainID)),
+	))
+
+	authTypeHash := gethcrypto.Keccak256([]byte(
+		"ClobAuth(address address,string timestamp,uint256 nonce,string message)",
+	))
+	structHash := gethcrypto.Keccak256(concat(
+		authTypeHash,
+		hexToBytes32(address),
+		gethcrypto.Keccak256([]byte(timestamp)),
+		pad32(big.NewInt(nonce)),
+		gethcrypto.Keccak256([]byte("This message attests that I control the given wallet")),
+	))
+
+	digest := gethcrypto.Keccak256(concat([]byte("\x19\x01"), domainSep, structHash))
+	sig, err := gethcrypto.Sign(digest, key)
+	if err != nil {
+		return "", err
+	}
+	sig[64] += 27
+	return "0x" + hex.EncodeToString(sig), nil
 }
 
 func fetchAPIKey(url string, headers map[string]string) (*polymarketCredentials, error) {
@@ -179,12 +219,26 @@ func personalSign(msg []byte, key *ecdsa.PrivateKey) (string, error) {
 
 // buildL2Headers constructs the HMAC-SHA256 authentication headers for L2 auth.
 // POLY_ADDRESS is the signer (EOA) address — the CLOB ties API keys to the signer, not the funder.
+// Matching py-clob-client: the secret is base64-urlsafe-decoded to get the HMAC key,
+// and the digest is base64-urlsafe-encoded (NOT hex). path is the bare request path
+// without query parameters.
 func buildL2Headers(creds *polymarketCredentials, method, path, body string) map[string]string {
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 	msg := ts + strings.ToUpper(method) + path + body
-	mac := hmac.New(sha256.New, []byte(creds.secret))
+
+	secretKey, err := base64.URLEncoding.DecodeString(creds.secret)
+	if err != nil {
+		// Some secrets arrive unpadded; retry with raw (no-padding) alphabet
+		secretKey, err = base64.RawURLEncoding.DecodeString(creds.secret)
+		if err != nil {
+			secretKey = []byte(creds.secret) // last resort: raw string
+		}
+	}
+
+	mac := hmac.New(sha256.New, secretKey)
 	mac.Write([]byte(msg))
-	sig := hex.EncodeToString(mac.Sum(nil))
+	sig := base64.URLEncoding.EncodeToString(mac.Sum(nil))
+
 	return map[string]string{
 		"POLY_ADDRESS":    creds.signerAddress,
 		"POLY_API_KEY":    creds.apiKey,
@@ -279,7 +333,7 @@ type clobOrderRequest struct {
 }
 
 type clobOrderJSON struct {
-	Salt          string `json:"salt"`
+	Salt          int64  `json:"salt"` // py-clob-client sends salt as a JSON number
 	Maker         string `json:"maker"`
 	Signer        string `json:"signer"`
 	Taker         string `json:"taker"`
@@ -344,7 +398,8 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 	}
 
 	// Use crypto/rand for salt — math/rand is deterministic and unsuitable for order security.
-	saltMax := new(big.Int).Lsh(big.NewInt(1), 128)
+	// Capped below 2^53 so it survives the JSON number round-trip (py-clob-client wire format).
+	saltMax := new(big.Int).Lsh(big.NewInt(1), 53)
 	salt, err := crand.Int(crand.Reader, saltMax)
 	if err != nil {
 		return "", fmt.Errorf("generate order salt: %w", err)
@@ -381,7 +436,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 
 	payload := clobOrderRequest{
 		Order: clobOrderJSON{
-			Salt:          salt.String(),
+			Salt:          salt.Int64(),
 			Maker:         makerAddr,
 			Signer:        p.walletAddress,
 			Taker:         "0x0000000000000000000000000000000000000000",
@@ -395,7 +450,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 			SignatureType: p.creds.signatureType,
 			Signature:     sig,
 		},
-		Owner:     makerAddr,
+		Owner:     p.creds.apiKey, // py-clob-client: owner is the API key, not an address
 		OrderType: "FOK",
 	}
 
@@ -448,16 +503,24 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 	return result.OrderID, nil
 }
 
-// getCLOBBalance fetches the real USDC balance for this wallet from Polymarket CLOB.
+// getCLOBBalance fetches the real USDC collateral balance from Polymarket CLOB.
+// Endpoint: GET /balance-allowance?asset_type=COLLATERAL&signature_type=N.
+// The HMAC signs the bare path (no query string), matching py-clob-client.
+// Response balance is in raw 6-decimal units (e.g. "15000000" = $15.00).
 func (p *PolymarketEngine) getCLOBBalance() (float64, error) {
 	if p.creds == nil {
 		return 0, fmt.Errorf("not initialized")
 	}
 
-	path := "/balance"
+	const path = "/balance-allowance"
 	headers := buildL2Headers(p.creds, "GET", path, "")
 
-	req, _ := http.NewRequest("GET", p.clobURL+path, nil)
+	url := fmt.Sprintf("%s%s?asset_type=COLLATERAL&signature_type=%d",
+		p.clobURL, path, p.creds.signatureType)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -468,16 +531,21 @@ func (p *PolymarketEngine) getCLOBBalance() (float64, error) {
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("balance-allowance HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var result struct {
 		Balance string `json:"balance"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, err
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return 0, fmt.Errorf("decode balance response: %w (body: %s)", err, string(respBody))
 	}
 
-	var bal float64
-	fmt.Sscanf(result.Balance, "%f", &bal)
-	return bal, nil
+	var raw float64
+	fmt.Sscanf(result.Balance, "%f", &raw)
+	return raw / 1e6, nil
 }
 
 // resolveTokenForPosition returns the CLOB token ID to sell given a position.
@@ -563,7 +631,7 @@ func loadLiveCredentials() (key *ecdsa.PrivateKey, signerAddr, funderAddr string
 		sigType = 1
 	}
 
-	creds, err = deriveOrFetchCredentials(key, signerAddr, sigType)
+	creds, err = deriveOrFetchCredentials(key, signerAddr, funderAddr, sigType)
 	if err != nil {
 		return nil, "", "", nil, fmt.Errorf("derive API credentials: %w", err)
 	}
