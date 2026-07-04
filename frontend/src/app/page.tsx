@@ -287,7 +287,9 @@ export default function Home() {
     }
   }, [logs]);
 
-  // Connect to Struct or Polymarket public WebSocket to stream trades in real-time
+  // Connect to Struct or Polymarket public WebSocket to stream trades in real-time.
+  // Reconnects with capped exponential backoff on drop/error; if the Struct feed
+  // fails before delivering a message it falls back to the raw CLOB WS.
   useEffect(() => {
     const activeMarket = status?.active_market;
     if (!activeMarket || !activeMarket.yes_token_id || !activeMarket.no_token_id) {
@@ -295,108 +297,137 @@ export default function Home() {
     }
 
     const structApiKey = status?.struct_api_key;
-    const useStruct = !!structApiKey;
-
-    // Connect to Struct WS if api key exists, otherwise fall back to raw Polymarket CLOB WS
-    const wsUrl = useStruct
-      ? `wss://api.struct.to/ws?api-key=${structApiKey}`
-      : "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-      
-    const socket = new WebSocket(wsUrl);
 
     // Buffers to accumulate trades and the latest price to prevent re-render storms (which crash browsers under high load)
     const pendingTrades: LiveTrade[] = [];
     let latestPrice: number | null = null;
 
-    socket.onopen = () => {
-      if (useStruct) {
-        // 1. Join room
-        socket.send(JSON.stringify({
-          type: "join_room",
-          payload: { room_id: "polymarket_trades" }
-        }));
-        // 2. Subscribe to YES and NO position IDs
-        socket.send(JSON.stringify({
-          type: "room_message",
-          payload: {
-            room_id: "polymarket_trades",
-            message: {
-              action: "subscribe",
-              position_ids: [activeMarket.yes_token_id, activeMarket.no_token_id]
-            }
-          }
-        }));
-      } else {
-        // Subscribe to raw Polymarket CLOB
-        const subPayload = {
-          type: "market",
-          assets_ids: [activeMarket.yes_token_id, activeMarket.no_token_id],
-          custom_feature_enabled: true
-        };
-        socket.send(JSON.stringify(subPayload));
-      }
-    };
+    let socket: WebSocket | null = null;
+    let disposed = false;
+    let attempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // Start on Struct when a key exists; drop to the raw CLOB feed if Struct errors before proving itself
+    let useStruct = !!structApiKey;
+    let gotMessage = false;
 
-    socket.onmessage = (event) => {
-      try {
-        const rawData = JSON.parse(event.data);
+    const connect = () => {
+      if (disposed) return;
 
+      const wsUrl = useStruct
+        ? `wss://api.struct.to/ws?api-key=${structApiKey}`
+        : "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
+      const ws = new WebSocket(wsUrl);
+      socket = ws;
+      gotMessage = false;
+
+      ws.onopen = () => {
+        if (disposed) { ws.close(); return; }
+        attempt = 0;
         if (useStruct) {
-          if (rawData.type === "trade_stream_update" && rawData.room_id === "polymarket_trades") {
-            const trade = rawData.data;
-            if (trade && trade.trade_type === "OrderFilled") {
-              const isYes = trade.position_id === activeMarket.yes_token_id;
-              const isNo = trade.position_id === activeMarket.no_token_id;
-
-              if (isYes || isNo) {
-                pendingTrades.push({
-                  outcome: isYes ? "YES" : "NO",
-                  price: trade.price,
-                  size: trade.shares_amount,
-                  side: trade.side === "Buy" || trade.side === "BUY" ? "BUY" : "SELL",
-                  timestamp: new Date().toLocaleTimeString(),
-                  usd_value: trade.usd_amount
-                });
-
-                // Track latest YES-equivalent price
-                latestPrice = isYes ? trade.price : (1.0 - trade.price);
+          // 1. Join room
+          ws.send(JSON.stringify({
+            type: "join_room",
+            payload: { room_id: "polymarket_trades" }
+          }));
+          // 2. Subscribe to YES and NO position IDs
+          ws.send(JSON.stringify({
+            type: "room_message",
+            payload: {
+              room_id: "polymarket_trades",
+              message: {
+                action: "subscribe",
+                position_ids: [activeMarket.yes_token_id, activeMarket.no_token_id]
               }
             }
-          }
+          }));
         } else {
-          const events = Array.isArray(rawData) ? rawData : [rawData];
-          events.forEach((ev: { event_type: string; price: string; size: string; asset_id: string; side: string }) => {
-            if (ev.event_type === "last_trade_price") {
-              const price = parseFloat(ev.price);
-              const size = parseFloat(ev.size);
-              if (!isNaN(price) && !isNaN(size)) {
-                const isYes = ev.asset_id === activeMarket.yes_token_id;
-                const isNo = ev.asset_id === activeMarket.no_token_id;
+          // Subscribe to raw Polymarket CLOB
+          ws.send(JSON.stringify({
+            type: "market",
+            assets_ids: [activeMarket.yes_token_id, activeMarket.no_token_id],
+            custom_feature_enabled: true
+          }));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        gotMessage = true;
+        try {
+          const rawData = JSON.parse(event.data);
+
+          if (useStruct) {
+            if (rawData.type === "trade_stream_update" && rawData.room_id === "polymarket_trades") {
+              const trade = rawData.data;
+              if (trade && trade.trade_type === "OrderFilled") {
+                const isYes = trade.position_id === activeMarket.yes_token_id;
+                const isNo = trade.position_id === activeMarket.no_token_id;
 
                 if (isYes || isNo) {
                   pendingTrades.push({
                     outcome: isYes ? "YES" : "NO",
-                    price,
-                    size,
-                    side: ev.side === "buy" || ev.side === "BUY" ? "BUY" : "SELL",
-                    timestamp: new Date().toLocaleTimeString()
+                    price: trade.price,
+                    size: trade.shares_amount,
+                    side: trade.side === "Buy" || trade.side === "BUY" ? "BUY" : "SELL",
+                    timestamp: new Date().toLocaleTimeString(),
+                    usd_value: trade.usd_amount
                   });
 
                   // Track latest YES-equivalent price
-                  latestPrice = isYes ? price : (1.0 - price);
+                  latestPrice = isYes ? trade.price : (1.0 - trade.price);
                 }
               }
             }
-          });
+          } else {
+            const events = Array.isArray(rawData) ? rawData : [rawData];
+            events.forEach((ev: { event_type: string; price: string; size: string; asset_id: string; side: string }) => {
+              if (ev.event_type === "last_trade_price") {
+                const price = parseFloat(ev.price);
+                const size = parseFloat(ev.size);
+                if (!isNaN(price) && !isNaN(size)) {
+                  const isYes = ev.asset_id === activeMarket.yes_token_id;
+                  const isNo = ev.asset_id === activeMarket.no_token_id;
+
+                  if (isYes || isNo) {
+                    pendingTrades.push({
+                      outcome: isYes ? "YES" : "NO",
+                      price,
+                      size,
+                      side: ev.side === "buy" || ev.side === "BUY" ? "BUY" : "SELL",
+                      timestamp: new Date().toLocaleTimeString()
+                    });
+
+                    // Track latest YES-equivalent price
+                    latestPrice = isYes ? price : (1.0 - price);
+                  }
+                }
+              }
+            });
+          }
+        } catch (err) {
+          console.warn("Error parsing WS trade message:", err);
         }
-      } catch (err) {
-        console.error("Error parsing WS trade message:", err);
-      }
+      };
+
+      // Errors always fire a close event right after — recovery lives in onclose.
+      ws.onerror = () => {
+        console.warn(`Trade stream (${useStruct ? "Struct" : "CLOB"}) errored — will reconnect.`);
+      };
+
+      ws.onclose = () => {
+        if (disposed) return;
+        // Struct never delivered anything before dying — fall back to the public CLOB feed
+        if (useStruct && !gotMessage) {
+          useStruct = false;
+          attempt = 0;
+        }
+        attempt++;
+        const backoff = Math.min(10000, 500 * 2 ** Math.min(attempt, 5)); // 1s → 10s cap
+        reconnectTimer = setTimeout(connect, backoff);
+      };
     };
 
-    socket.onerror = (err) => {
-      console.error("WebSocket Error:", err);
-    };
+    connect();
 
     // Periodically flush accumulated trades and price updates to state once every 1000ms
     const flushInterval = setInterval(() => {
@@ -415,9 +446,19 @@ export default function Home() {
     }, 1000);
 
     return () => {
+      disposed = true;
       clearInterval(flushInterval);
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close();
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      const ws = socket;
+      if (!ws) return;
+      // Closing a CONNECTING socket logs a browser warning — defer until open.
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        ws.onopen = () => ws.close();
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.onerror = null;
       }
     };
   }, [status?.active_market?.yes_token_id, status?.active_market?.no_token_id, status?.struct_api_key]);
