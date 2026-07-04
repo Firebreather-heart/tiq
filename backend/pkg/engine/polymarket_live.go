@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -537,6 +538,12 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		// On a fill failure, snapshot the live book so we can tell a pricing
+		// problem (our limit sits inside the spread) from a depth problem (the
+		// book genuinely can't fill our size) — the two need opposite fixes.
+		if strings.Contains(string(respBody), "fully filled") {
+			p.logBookContext(tokenID, side, shares, tickPrice)
+		}
 		return "", fmt.Errorf("CLOB returned HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -550,6 +557,10 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 		return "", fmt.Errorf("decode CLOB response: %w (body: %s)", err, string(respBody))
 	}
 
+	// Log the raw fill response once per order so we can learn the exact schema
+	// (making/taking amounts) and reconcile actual fill price vs our limit.
+	p.store.Log("INFO", fmt.Sprintf("[CLOB Fill] raw response: %s", string(respBody)))
+
 	if result.ErrorMsg != "" {
 		return "", fmt.Errorf("CLOB order rejected: %s", result.ErrorMsg)
 	}
@@ -560,6 +571,73 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 	}
 
 	return result.OrderID, nil
+}
+
+// logBookContext fetches the live order book for a token and logs whether our
+// order could theoretically fill: the best ask, the price that would sweep our
+// full share count, and the total marketable depth. Diagnostic only.
+func (p *PolymarketEngine) logBookContext(tokenID string, side uint8, shares, limitPrice float64) {
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(p.clobURL + "/book?token_id=" + tokenID)
+	if err != nil {
+		p.store.Log("WARN", fmt.Sprintf("[CLOB Book] fetch failed for fill diagnosis: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var book struct {
+		Bids []struct{ Price, Size string } `json:"bids"`
+		Asks []struct{ Price, Size string } `json:"asks"`
+	}
+	if err := json.Unmarshal(body, &book); err != nil {
+		p.store.Log("WARN", fmt.Sprintf("[CLOB Book] parse failed: %v", err))
+		return
+	}
+
+	pf := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
+
+	// A BUY sweeps asks from the lowest price up; a SELL sweeps bids from the
+	// highest price down. Accumulate size until we cover our share count and
+	// record the worst price consumed (the effective marketable limit).
+	levels := book.Asks
+	if side == 1 {
+		levels = book.Bids
+	}
+	// Sort so index 0 is the most aggressive level we'd hit first.
+	sort.Slice(levels, func(i, j int) bool {
+		if side == 1 {
+			return pf(levels[i].Price) > pf(levels[j].Price) // bids: high→low
+		}
+		return pf(levels[i].Price) < pf(levels[j].Price) // asks: low→high
+	})
+
+	best := 0.0
+	if len(levels) > 0 {
+		best = pf(levels[0].Price)
+	}
+	var cum, sweep float64
+	filled := false
+	for _, lvl := range levels {
+		cum += pf(lvl.Size)
+		sweep = pf(lvl.Price)
+		if cum >= shares {
+			filled = true
+			break
+		}
+	}
+
+	sideStr := "BUY(asks)"
+	if side == 1 {
+		sideStr = "SELL(bids)"
+	}
+	if filled {
+		p.store.Log("INFO", fmt.Sprintf("[CLOB Book] %s need %.0f sh @ limit $%.2f | best $%.3f | full-size sweep price $%.3f (%s) | depth ok",
+			sideStr, shares, limitPrice, best, sweep,
+			map[bool]string{true: "marketable — limit too passive", false: "within limit"}[sweep > limitPrice]))
+	} else {
+		p.store.Log("INFO", fmt.Sprintf("[CLOB Book] %s need %.0f sh @ limit $%.2f | best $%.3f | only %.0f sh available total — book too thin",
+			sideStr, shares, limitPrice, best, cum))
+	}
 }
 
 // getCLOBBalance fetches the real USDC collateral balance from Polymarket CLOB.
