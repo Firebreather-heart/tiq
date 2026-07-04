@@ -149,6 +149,12 @@ interface WinRateStats {
   };
 }
 
+// Live starting capital for the Polymarket account. "Overall profit" on the
+// dashboard is measured against this baseline using the real CLOB-synced
+// balance/equity — not the sum of per-trade recorded PnL, which is logged at
+// limit prices and understates actual fills.
+const STARTING_CAPITAL = 15;
+
 export default function Home() {
   // Connection state
   const [backendURL, setBackendURL] = useState("");
@@ -1129,39 +1135,52 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Latency Arbitrage Win Rate Card */}
+            {/* Latency Arbitrage — Overall Profit on starting capital */}
             {(() => {
               const polyStats = winStats.polymarket_stats || { total_trades: 0, wins: 0, losses: 0, win_rate: 0, total_pnl: 0 };
               const rate = polyStats.win_rate || 0;
               const trades = polyStats.total_trades || 0;
               const wins = polyStats.wins || 0;
               const losses = polyStats.losses || 0;
-              const pnl = polyStats.total_pnl || 0;
-              const isGood = rate >= 50;
-              const ringColor = rate === 0 ? "#334155" : isGood ? "#3b82f6" : "#f59e0b";
-              const textColor = rate === 0 ? "text-slate-500" : isGood ? "text-blue-400" : "text-amber-400";
+
+              // Real profit vs the $15 baseline, from the CLOB-synced equity
+              // (mark-to-market when a position is open, == balance when flat).
+              const equityNow = status ? (status.equity ?? status.balance ?? STARTING_CAPITAL) : null;
+              const profit = equityNow === null ? 0 : equityNow - STARTING_CAPITAL;
+              const profitPct = (profit / STARTING_CAPITAL) * 100;
+              const up = profit >= 0;
+              const ringColor = equityNow === null ? "#334155" : up ? "#10b981" : "#f43f5e";
+              const profitColor = equityNow === null ? "text-slate-500" : up ? "text-emerald-400" : "text-rose-400";
+              // Ring fills proportional to |return|, capped at one full turn (100% gain/loss).
               const circum = 113.1;
-              const dash = (rate / 100) * circum;
+              const dash = Math.min(Math.abs(profitPct) / 100, 1) * circum;
               return (
                 <div className="bg-slate-900/40 border border-slate-900 p-5 rounded-2xl flex items-center justify-between gap-3">
                   <div className="flex-1 min-w-0">
-                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Latency Arbitrage</p>
-                    <h3 className={`text-xl font-black mt-1 font-mono ${textColor}`}>
-                      {trades > 0 ? `${rate.toFixed(1)}%` : "—"}
+                    <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Overall Profit</p>
+                    <h3 className={`text-xl font-black mt-1 font-mono ${profitColor}`}>
+                      {equityNow === null ? "—" : `${up ? "+" : "−"}$${Math.abs(profit).toFixed(2)}`}
                     </h3>
                     <div className="flex gap-2 mt-1.5 text-[9px] font-mono text-slate-500">
-                      <span className="text-blue-400">{wins}W</span>
-                      <span className="text-rose-400">{losses}L</span>
-                      <span className={pnl >= 0 ? "text-emerald-400" : "text-rose-400"}>
-                        {pnl >= 0 ? "+" : ""}{pnl.toFixed(2)}
-                      </span>
+                      {equityNow !== null && (
+                        <span className={up ? "text-emerald-400" : "text-rose-400"}>
+                          {up ? "+" : "−"}{Math.abs(profitPct).toFixed(1)}%
+                        </span>
+                      )}
+                      <span className="text-slate-500">on ${STARTING_CAPITAL.toFixed(0)}</span>
+                      {trades > 0 && (
+                        <span className="text-slate-600">·</span>
+                      )}
+                      {trades > 0 && (
+                        <span title="win rate / wins / losses">{rate.toFixed(0)}% ({wins}W {losses}L)</span>
+                      )}
                     </div>
                   </div>
                   <svg width="44" height="44" viewBox="0 0 44 44" className="shrink-0">
                     <circle cx="22" cy="22" r="18" fill="none" stroke="#1e293b" strokeWidth="4" />
-                    {trades > 0 && (
+                    {equityNow !== null && Math.abs(profit) > 0.005 && (
                       <circle
-                         cx="22" cy="22" r="18"
+                        cx="22" cy="22" r="18"
                         fill="none"
                         stroke={ringColor}
                         strokeWidth="4"
@@ -1171,8 +1190,8 @@ export default function Home() {
                         style={{ filter: `drop-shadow(0 0 4px ${ringColor})` }}
                       />
                     )}
-                    <text x="22" y="26" textAnchor="middle" fill={trades === 0 ? "#475569" : ringColor} fontSize="9" fontWeight="bold" fontFamily="monospace">
-                      {trades}T
+                    <text x="22" y="26" textAnchor="middle" fill={equityNow === null ? "#475569" : ringColor} fontSize="9" fontWeight="bold" fontFamily="monospace">
+                      {equityNow === null ? "—" : `${up ? "+" : "−"}${Math.abs(profitPct).toFixed(0)}%`}
                     </text>
                   </svg>
                 </div>
