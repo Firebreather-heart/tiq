@@ -640,6 +640,82 @@ func (p *PolymarketEngine) logBookContext(tokenID string, side uint8, shares, li
 	}
 }
 
+type bookLevel struct {
+	price float64
+	size  float64
+}
+
+// fetchBookLevels returns one side of the live CLOB book, sorted most-aggressive
+// first: asks low→high (side 0, what a BUY consumes), bids high→low (side 1, what
+// a SELL consumes).
+func (p *PolymarketEngine) fetchBookLevels(tokenID string, side int) ([]bookLevel, error) {
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(p.clobURL + "/book?token_id=" + tokenID)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var book struct {
+		Bids []struct{ Price, Size string } `json:"bids"`
+		Asks []struct{ Price, Size string } `json:"asks"`
+	}
+	if err := json.Unmarshal(body, &book); err != nil {
+		return nil, err
+	}
+	raw := book.Asks
+	if side == 1 {
+		raw = book.Bids
+	}
+	pf := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
+	levels := make([]bookLevel, 0, len(raw))
+	for _, l := range raw {
+		levels = append(levels, bookLevel{pf(l.Price), pf(l.Size)})
+	}
+	sort.Slice(levels, func(i, j int) bool {
+		if side == 1 {
+			return levels[i].price > levels[j].price
+		}
+		return levels[i].price < levels[j].price
+	})
+	return levels, nil
+}
+
+// GetMarketablePrice reads the live CLOB book and returns the limit price at
+// which `shares` of the YES/NO token can be fully filled right now: the worst
+// price swept, ceil'd to the $0.01 tick for a BUY (side 0) so the order crosses,
+// floor'd for a SELL (side 1). fillable is false when the book lacks the depth.
+// This is the real executable price — used to re-check edge before committing,
+// replacing the lagged last-trade feed the strategy computes EV from.
+func (p *PolymarketEngine) GetMarketablePrice(isYes bool, side int, shares float64) (price float64, fillable bool, err error) {
+	p.mu.RLock()
+	tokenID := p.yesTokenID
+	if !isYes {
+		tokenID = p.noTokenID
+	}
+	p.mu.RUnlock()
+	if tokenID == "" {
+		return 0, false, fmt.Errorf("token id unavailable")
+	}
+
+	levels, err := p.fetchBookLevels(tokenID, side)
+	if err != nil {
+		return 0, false, err
+	}
+	var cum, sweep float64
+	for _, lvl := range levels {
+		cum += lvl.size
+		sweep = lvl.price
+		if cum >= shares {
+			if side == 0 {
+				return math.Ceil(sweep*100) / 100, true, nil
+			}
+			return math.Floor(sweep*100) / 100, true, nil
+		}
+	}
+	return 0, false, nil // book too thin for this size
+}
+
 // getCLOBBalance fetches the real USDC collateral balance from Polymarket CLOB.
 // Endpoint: GET /balance-allowance?asset_type=COLLATERAL&signature_type=N.
 // The HMAC signs the bare path (no query string), matching py-clob-client.

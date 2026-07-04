@@ -159,56 +159,11 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	riskCapital := 5.00
 
 	if yesEV >= pr.cfg.MinExpectedValue {
-		// Boundary check: token must still be near $0.50 — if it's already repriced past this
-		// range, Polymarket has already recognized the lag and the entry opportunity is gone.
-		if marketYesPrice < 0.35 || marketYesPrice > 0.65 {
-			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected but YES price ($%.2f) shows Polymarket has already repriced. Entry window closed.", marketYesPrice))
-			return nil
-		}
-
-		// Verify Struct order book depth — soft check only (Struct connects post-entry, so book
-		// may be empty at evaluation time; warn but do not block).
-		ok, err := pr.polyEngine.CheckOrderBookLiquidity(true, 3.0*riskCapital)
-		if err != nil {
-			pr.store.Log("WARN", fmt.Sprintf("[Polymarket Strategy] Liquidity check error (non-blocking): %v", err))
-		}
-		if !ok {
-			pr.store.Log("INFO", "[Polymarket Strategy] Order book thin or unavailable — proceeding anyway (Struct not yet connected).")
-		}
-
-		// Buy YES tokens
-		units := riskCapital / marketYesPrice
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected! Buying %.2f YES tokens. Risk USDC: $%.2f", units, riskCapital))
-		
-		// Scalp limits: SL = entry - 0.03 (tight stop), TP = entry + 60% of the entry edge (fast catch-up exit before the lag closes)
-		_, err = pr.polyEngine.OpenPosition(targetInstrument, units, marketYesPrice, marketYesPrice - 0.03, marketYesPrice + 0.6*yesEV)
-		if err != nil {
+		if err := pr.enterLiveEdge(targetInstrument, true, trueYesProbability, marketYesPrice, riskCapital); err != nil {
 			return err
 		}
 	} else if noEV >= pr.cfg.MinExpectedValue {
-		// Boundary check: token must still be near $0.50 — already repriced = opportunity gone.
-		if marketNoPrice < 0.35 || marketNoPrice > 0.65 {
-			pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected but NO price ($%.2f) shows Polymarket has already repriced. Entry window closed.", marketNoPrice))
-			return nil
-		}
-
-		// Verify Struct order book depth — soft check only (Struct connects post-entry, so book
-		// may be empty at evaluation time; warn but do not block).
-		ok, err := pr.polyEngine.CheckOrderBookLiquidity(false, 3.0*riskCapital)
-		if err != nil {
-			pr.store.Log("WARN", fmt.Sprintf("[Polymarket Strategy] Liquidity check error (non-blocking): %v", err))
-		}
-		if !ok {
-			pr.store.Log("INFO", "[Polymarket Strategy] Order book thin or unavailable — proceeding anyway (Struct not yet connected).")
-		}
-
-		// Buy NO tokens (represented as negative units)
-		units := -riskCapital / marketNoPrice
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Edge detected! Buying %.2f NO tokens. Risk USDC: $%.2f", math.Abs(units), riskCapital))
-		
-		// Scalp limits: SL = entry - 0.03 (tight stop), TP = entry + 60% of the entry edge (fast catch-up exit before the lag closes)
-		_, err = pr.polyEngine.OpenPosition(targetInstrument, units, marketNoPrice, marketNoPrice - 0.03, marketNoPrice + 0.6*noEV)
-		if err != nil {
+		if err := pr.enterLiveEdge(targetInstrument, false, trueNoProbability, marketNoPrice, riskCapital); err != nil {
 			return err
 		}
 	} else {
@@ -216,5 +171,52 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	}
 
 	return nil
+}
+
+// enterLiveEdge re-evaluates a detected edge against the LIVE CLOB order book
+// before committing. The feed-derived EV that got us here uses a lagged
+// last-trade price; the real executable price can be well above it once
+// Polymarket has repriced. We fetch the marketable ask for our size and:
+//   - skip if the book is too thin to fill,
+//   - skip if the edge no longer clears the threshold at the real price
+//     (the lag already closed — filling here would overpay),
+//   - otherwise buy AT the marketable price so the FOK actually crosses.
+//
+// isYes selects the token; feedPrice is the stale price used only for logging
+// and initial sizing; trueProb is the Black-Scholes fair probability.
+func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, trueProb, feedPrice, riskCapital float64) error {
+	side := "NO"
+	sign := -1.0
+	if isYes {
+		side, sign = "YES", 1.0
+	}
+
+	estUnits := riskCapital / feedPrice
+	livePrice, fillable, err := pr.polyEngine.GetMarketablePrice(isYes, 0, estUnits)
+	if err != nil || !fillable {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s edge seen but live book unavailable/too thin (fillable=%t, err=%v) — skipping.", side, fillable, err))
+		return nil
+	}
+
+	liveEdge := trueProb - livePrice
+	if liveEdge < pr.cfg.MinExpectedValue {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s edge gone at LIVE ask $%.2f (feed showed $%.2f, live edge $%.2f < $%.2f) — Polymarket already repriced. Skipping.",
+			side, livePrice, feedPrice, liveEdge, pr.cfg.MinExpectedValue))
+		return nil
+	}
+
+	// Boundary guard against the real price, not the stale feed.
+	if livePrice < 0.35 || livePrice > 0.65 {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Live %s ask $%.2f outside $0.35–$0.65 boundary — skipping.", side, livePrice))
+		return nil
+	}
+
+	units := sign * riskCapital / livePrice
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] LIVE edge confirmed! Buying %.2f %s @ live ask $%.2f (edge $%.2f; feed said $%.2f). Risk $%.2f.",
+		math.Abs(units), side, livePrice, liveEdge, feedPrice, riskCapital))
+
+	// Scalp limits anchored to the real fill price: SL = entry-$0.03, TP = entry + 60% of live edge.
+	_, err = pr.polyEngine.OpenPosition(targetInstrument, units, livePrice, livePrice-0.03, livePrice+0.6*liveEdge)
+	return err
 }
 
