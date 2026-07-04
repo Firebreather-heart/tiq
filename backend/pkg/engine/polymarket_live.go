@@ -65,20 +65,28 @@ func loadPrivateKey(hexKey string) (*ecdsa.PrivateKey, string, error) {
 // It calls GET /auth/api-key first; if none exist it creates them via POST.
 //
 // L1 auth uses an EIP-712 typed signature of the ClobAuth struct (matching the
-// official py-clob-client), NOT a personal_sign of the timestamp. POLY_ADDRESS
-// is always the EOA signer address — API keys are bound to the signing key;
-// the funder/proxy wallet only appears later in order payloads.
+// official py-clob-client), NOT a personal_sign of the timestamp.
+//
+// Address binding: for EOA/proxy accounts the API key is bound to the EOA.
+// For POLY_1271 deposit wallets the key must be bound to the deposit wallet
+// itself — the CLOB requires order.signer == API-key address, and 1271 orders
+// carry the contract as signer. The ClobAuth signature still comes from the
+// EOA; the server validates it via EIP-1271 against the deposit wallet.
 func deriveOrFetchCredentials(key *ecdsa.PrivateKey, signerAddr, funderAddr string, sigType int) (*polymarketCredentials, error) {
 	const clobBase = "https://clob.polymarket.com"
 	ts := fmt.Sprintf("%d", time.Now().Unix())
 
-	sig, err := signClobAuth(key, signerAddr, ts, 0)
+	// API keys are strictly EOA-bound: the CLOB verifies the ClobAuth signature
+	// by ECDSA recovery against POLY_ADDRESS (a wallet-address binding 401s).
+	authAddr := signerAddr
+
+	sig, err := signClobAuth(key, authAddr, ts, 0)
 	if err != nil {
 		return nil, fmt.Errorf("L1 sign failed: %w", err)
 	}
 
 	headers := map[string]string{
-		"POLY_ADDRESS":   signerAddr,
+		"POLY_ADDRESS":   authAddr,
 		"POLY_SIGNATURE": sig,
 		"POLY_TIMESTAMP": ts,
 		"POLY_NONCE":     "0",
@@ -93,13 +101,13 @@ func deriveOrFetchCredentials(key *ecdsa.PrivateKey, signerAddr, funderAddr stri
 	for attempt := 1; attempt <= 3; attempt++ {
 		creds, getErr = fetchAPIKey(clobBase+"/auth/derive-api-key", headers)
 		if getErr == nil {
-			creds.signerAddress = signerAddr
+			creds.signerAddress = authAddr
 			creds.signatureType = sigType
 			return creds, nil
 		}
 		creds, postErr = createAPIKey(clobBase+"/auth/api-key", headers, nil)
 		if postErr == nil {
-			creds.signerAddress = signerAddr
+			creds.signerAddress = authAddr
 			creds.signatureType = sigType
 			return creds, nil
 		}
@@ -441,12 +449,19 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 		return "", fmt.Errorf("generate order salt: %w", err)
 	}
 
-	// For Magic.link accounts: maker = funder (proxy wallet holding USDC),
-	// signer = EOA address derived from private key.
-	// For EOA accounts: maker = signer = walletAddress.
+	// Maker is always the wallet holding USDC (funder when set, else the EOA).
+	// Signer depends on signature type (mirrors py-clob-client-v2 _v2_order_signer):
+	//   POLY_1271 (3): signer = funder — the deposit wallet contract validates the
+	//                  EOA's signature via EIP-1271, and the CLOB requires
+	//                  order.signer == the API-key-bound address (the wallet).
+	//   otherwise:     signer = EOA address derived from the private key.
 	makerAddr := p.walletAddress
 	if p.funderAddress != "" {
 		makerAddr = p.funderAddress
+	}
+	orderSigner := p.walletAddress
+	if p.creds.signatureType == 3 && p.funderAddress != "" {
+		orderSigner = p.funderAddress
 	}
 
 	sigType := uint8(p.creds.signatureType)
@@ -455,7 +470,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 	order := clobOrder{
 		Salt:          salt,
 		Maker:         makerAddr,
-		Signer:        p.walletAddress,
+		Signer:        orderSigner,
 		TokenID:       tokenBig,
 		MakerAmount:   makerAmtRaw,
 		TakerAmount:   takerAmtRaw,
@@ -480,7 +495,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 		Order: clobOrderJSON{
 			Salt:          salt.Int64(), // capped < 2^53 at generation
 			Maker:         makerAddr,
-			Signer:        p.walletAddress,
+			Signer:        orderSigner,
 			TokenID:       tokenID,
 			MakerAmount:   makerAmtRaw.String(),
 			TakerAmount:   takerAmtRaw.String(),
