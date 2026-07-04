@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,22 +85,27 @@ func deriveOrFetchCredentials(key *ecdsa.PrivateKey, signerAddr, funderAddr stri
 		"Content-Type":   "application/json",
 	}
 
-	// Try GET first (returns existing key if already created)
-	creds, err := fetchAPIKey(clobBase+"/auth/derive-api-key", headers)
-	if err == nil {
-		creds.signerAddress = signerAddr
-		creds.signatureType = sigType
-		return creds, nil
+	// GET derives the existing key; POST creates one on first use. Either can
+	// fail transiently (flaky DNS/network at startup), and a failed GET followed
+	// by a POST against an existing key 400s — so retry the whole sequence.
+	var creds *polymarketCredentials
+	var getErr, postErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		creds, getErr = fetchAPIKey(clobBase+"/auth/derive-api-key", headers)
+		if getErr == nil {
+			creds.signerAddress = signerAddr
+			creds.signatureType = sigType
+			return creds, nil
+		}
+		creds, postErr = createAPIKey(clobBase+"/auth/api-key", headers, nil)
+		if postErr == nil {
+			creds.signerAddress = signerAddr
+			creds.signatureType = sigType
+			return creds, nil
+		}
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
 	}
-
-	// Create new API key
-	creds, err = createAPIKey(clobBase+"/auth/api-key", headers, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Polymarket API key: %w", err)
-	}
-	creds.signerAddress = signerAddr
-	creds.signatureType = sigType
-	return creds, nil
+	return nil, fmt.Errorf("failed to obtain Polymarket API key after 3 attempts (derive: %v; create: %w)", getErr, postErr)
 }
 
 // signClobAuth builds the EIP-712 ClobAuth attestation signature Polymarket's
@@ -664,9 +670,15 @@ func loadLiveCredentials() (key *ecdsa.PrivateKey, signerAddr, funderAddr string
 
 	funderAddr = os.Getenv("POLY_FUNDER_ADDRESS")
 
+	// V2 signature types: 0=EOA, 1=POLY_PROXY (legacy Magic.link proxy),
+	// 2=POLY_GNOSIS_SAFE, 3=POLY_1271 (deposit wallets / smart contract wallets).
 	sigType := 0
-	if os.Getenv("POLY_SIGNATURE_TYPE") == "1" {
-		sigType = 1
+	if v := os.Getenv("POLY_SIGNATURE_TYPE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 3 {
+			sigType = n
+		} else {
+			return nil, "", "", nil, fmt.Errorf("invalid POLY_SIGNATURE_TYPE %q (must be 0-3)", v)
+		}
 	}
 
 	creds, err = deriveOrFetchCredentials(key, signerAddr, funderAddr, sigType)
