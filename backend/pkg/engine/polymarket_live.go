@@ -342,13 +342,16 @@ type clobOrderRequest struct {
 	Order     clobOrderJSON `json:"order"`
 	Owner     string        `json:"owner"`
 	OrderType string        `json:"orderType"` // "FOK", "GTC", "GTD"
+	DeferExec bool          `json:"deferExec"`
 	PostOnly  bool          `json:"postOnly"`
 }
 
-// clobOrderJSON is the V2 wire format. expiration stays in the body for
-// GTD/order-expiry handling but is NOT part of the signed struct.
+// clobOrderJSON is the V2 wire format (mirrors py-clob-client-v2
+// order_to_json_v2: salt is a JSON number, everything else strings/ints).
+// expiration stays in the body for GTD handling but is NOT part of the
+// signed struct.
 type clobOrderJSON struct {
-	Salt          string `json:"salt"`
+	Salt          int64  `json:"salt"`
 	Maker         string `json:"maker"`
 	Signer        string `json:"signer"`
 	TokenID       string `json:"tokenId"`
@@ -469,7 +472,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 	zeroBytes32Hex := "0x0000000000000000000000000000000000000000000000000000000000000000"
 	payload := clobOrderRequest{
 		Order: clobOrderJSON{
-			Salt:          salt.String(),
+			Salt:          salt.Int64(), // capped < 2^53 at generation
 			Maker:         makerAddr,
 			Signer:        p.walletAddress,
 			TokenID:       tokenID,
@@ -485,6 +488,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 		},
 		Owner:     p.creds.apiKey, // owner is the API key, not an address
 		OrderType: "FOK",
+		DeferExec: false,
 		PostOnly:  false,
 	}
 
