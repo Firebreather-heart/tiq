@@ -19,6 +19,7 @@ type PolymarketMarketInfo struct {
 	NoPrice        float64   `json:"no_price"`
 	YesTokenID     string    `json:"yes_token_id"`
 	NoTokenID      string    `json:"no_token_id"`
+	NegRisk        bool      `json:"neg_risk"` // selects the V2 exchange contract for order signing
 }
 
 // FetchActivePolymarketStrike queries the real Polymarket Gamma API for the active BTC contract closest to spot
@@ -49,6 +50,7 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 		Closed        bool   `json:"closed"`
 		OutcomePrices string `json:"outcomePrices"`
 		ClobTokenIds  string `json:"clobTokenIds"`
+		NegRisk       bool   `json:"negRisk"`
 	}
 
 	if resp.StatusCode == http.StatusOK {
@@ -95,6 +97,7 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 					NoPrice:        noPrice,
 					YesTokenID:     yesTokenID,
 					NoTokenID:      noTokenID,
+					NegRisk:        m.NegRisk,
 				}, nil
 			}
 		}
@@ -153,6 +156,7 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 					NoPrice:        noPrice,
 					YesTokenID:     yesTokenID,
 					NoTokenID:      noTokenID,
+					NegRisk:        m.NegRisk,
 				}, nil
 			}
 		}

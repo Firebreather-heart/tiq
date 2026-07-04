@@ -87,6 +87,7 @@ type PolymarketEngine struct {
 	clobURL             string
 	yesTokenID          string
 	noTokenID           string
+	negRiskMarket       bool // from Gamma API; selects the V2 exchange contract for signing
 	activeMarketAddress string
 	wsConn              *websocket.Conn
 	structConn          *websocket.Conn // position-scoped Struct WS; nil when flat
@@ -772,7 +773,7 @@ func (p *PolymarketEngine) StartWSListener() {
 	}
 }
 
-func (p *PolymarketEngine) SubscribeToMarketTokens(yesToken, noToken, marketAddr string) {
+func (p *PolymarketEngine) SubscribeToMarketTokens(yesToken, noToken, marketAddr string, negRisk bool) {
 	activeKey := priceKey(marketAddr)
 
 	p.mu.Lock()
@@ -780,6 +781,7 @@ func (p *PolymarketEngine) SubscribeToMarketTokens(yesToken, noToken, marketAddr
 	oldNo := p.noTokenID
 	p.yesTokenID = yesToken
 	p.noTokenID = noToken
+	p.negRiskMarket = negRisk
 	p.activeMarketAddress = marketAddr
 
 	// Bound the price maps: drop stale poly_ keys from prior contracts (positions never

@@ -198,7 +198,7 @@ func (r *Runner) Tick() error {
 			
 			// Subscribe the Polymarket engine to the active YES/NO contract CLOB tokens in real-time
 			if polyEng, ok := r.engine.(*engine.PolymarketEngine); ok {
-				polyEng.SubscribeToMarketTokens(liveMarket.YesTokenID, liveMarket.NoTokenID, marketAddr)
+				polyEng.SubscribeToMarketTokens(liveMarket.YesTokenID, liveMarket.NoTokenID, marketAddr, liveMarket.NegRisk)
 			}
 
 			r.polyMu.Lock()

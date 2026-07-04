@@ -25,10 +25,13 @@ import (
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
-// Polymarket CTF Exchange (Polygon mainnet)
+// Polymarket CTF Exchange V2 (Polygon mainnet, since the April 2026 CLOB V2 migration).
+// Binary btc-updown markets are standard (negRisk=false); neg-risk multi-outcome
+// markets settle through a different exchange contract.
 const (
-	clobExchangeAddr = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-	polyChainID      = 137
+	clobExchangeAddrV2        = "0xE111180000d2663C0091e4f400237545B87B996B"
+	clobExchangeAddrV2NegRisk = "0xe2222d279d744050d28e00520010520000310F59"
+	polyChainID               = 137
 )
 
 // Order side constants
@@ -254,22 +257,27 @@ func buildL2Headers(creds *polymarketCredentials, method, path, body string) map
 // EIP-712 Order Signing
 // ---------------------------------------------------------------------------
 
-// orderTypeHash is keccak256 of the Polymarket Order type string.
+// orderTypeHash is keccak256 of the CLOB V2 Order type string.
+// V2 dropped taker/expiration/nonce/feeRateBps from the signed struct and
+// added timestamp (ms, replaces nonce for uniqueness), metadata and builder.
 var orderTypeHash = gethcrypto.Keccak256([]byte(
-	"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
+	"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)",
 ))
 
-// domainSeparator for Polymarket CTF Exchange on Polygon mainnet.
-var domainSeparator = computeDomainSeparator()
+// V2 domain separators (version "2"); the ClobAuthDomain used for L1 auth stays at v1.
+var (
+	domainSeparatorV2        = computeDomainSeparator(clobExchangeAddrV2)
+	domainSeparatorV2NegRisk = computeDomainSeparator(clobExchangeAddrV2NegRisk)
+)
 
-func computeDomainSeparator() []byte {
+func computeDomainSeparator(exchangeAddr string) []byte {
 	domainTypeHash := gethcrypto.Keccak256([]byte(
 		"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
 	))
 	nameHash := gethcrypto.Keccak256([]byte("Polymarket CTF Exchange"))
-	versionHash := gethcrypto.Keccak256([]byte("1"))
+	versionHash := gethcrypto.Keccak256([]byte("2"))
 	chainID := pad32(big.NewInt(polyChainID))
-	exchange := hexToBytes32(clobExchangeAddr)
+	exchange := hexToBytes32(exchangeAddr)
 	packed := concat(domainTypeHash, nameHash, versionHash, chainID, exchange)
 	return gethcrypto.Keccak256(packed)
 }
@@ -278,38 +286,42 @@ type clobOrder struct {
 	Salt          *big.Int
 	Maker         string
 	Signer        string
-	Taker         string
 	TokenID       *big.Int
 	MakerAmount   *big.Int // USDC in 6-decimal units
 	TakerAmount   *big.Int // shares in 6-decimal units
-	Expiration    *big.Int
-	Nonce         *big.Int
-	FeeRateBps    *big.Int
 	Side          uint8    // 0=BUY, 1=SELL
 	SignatureType uint8    // 0=EOA, 1=Magic.link
+	Timestamp     *big.Int // order creation time in milliseconds
+	Metadata      [32]byte
+	Builder       [32]byte // zero unless attaching a builder code
 }
 
-// signEIP712Order computes the EIP-712 hash of an order and signs it.
-func signEIP712Order(order clobOrder, key *ecdsa.PrivateKey) (string, error) {
+// signEIP712Order computes the V2 EIP-712 hash of an order and signs it.
+// negRisk selects the exchange contract the order settles through.
+func signEIP712Order(order clobOrder, key *ecdsa.PrivateKey, negRisk bool) (string, error) {
 	structHash := gethcrypto.Keccak256(concat(
 		orderTypeHash,
 		pad32(order.Salt),
 		hexToBytes32(order.Maker),
 		hexToBytes32(order.Signer),
-		hexToBytes32(order.Taker),
 		pad32(order.TokenID),
 		pad32(order.MakerAmount),
 		pad32(order.TakerAmount),
-		pad32(order.Expiration),
-		pad32(order.Nonce),
-		pad32(order.FeeRateBps),
 		padUint8(order.Side),
 		padUint8(order.SignatureType),
+		pad32(order.Timestamp),
+		order.Metadata[:], // bytes32 encodes as its raw 32 bytes
+		order.Builder[:],
 	))
+
+	domainSep := domainSeparatorV2
+	if negRisk {
+		domainSep = domainSeparatorV2NegRisk
+	}
 
 	digest := gethcrypto.Keccak256(concat(
 		[]byte("\x19\x01"),
-		domainSeparator,
+		domainSep,
 		structHash,
 	))
 
@@ -330,21 +342,24 @@ type clobOrderRequest struct {
 	Order     clobOrderJSON `json:"order"`
 	Owner     string        `json:"owner"`
 	OrderType string        `json:"orderType"` // "FOK", "GTC", "GTD"
+	PostOnly  bool          `json:"postOnly"`
 }
 
+// clobOrderJSON is the V2 wire format. expiration stays in the body for
+// GTD/order-expiry handling but is NOT part of the signed struct.
 type clobOrderJSON struct {
-	Salt          int64  `json:"salt"` // py-clob-client sends salt as a JSON number
+	Salt          string `json:"salt"`
 	Maker         string `json:"maker"`
 	Signer        string `json:"signer"`
-	Taker         string `json:"taker"`
 	TokenID       string `json:"tokenId"`
 	MakerAmount   string `json:"makerAmount"`
 	TakerAmount   string `json:"takerAmount"`
 	Expiration    string `json:"expiration"`
-	Nonce         string `json:"nonce"`
-	FeeRateBps    string `json:"feeRateBps"`
 	Side          string `json:"side"`
 	SignatureType int    `json:"signatureType"`
+	Timestamp     string `json:"timestamp"` // milliseconds, matches signed struct
+	Metadata      string `json:"metadata"`
+	Builder       string `json:"builder"`
 	Signature     string `json:"signature"`
 }
 
@@ -414,44 +429,51 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount flo
 	}
 
 	sigType := uint8(p.creds.signatureType)
+	nowMs := big.NewInt(time.Now().UnixMilli())
+	var zero32 [32]byte
 	order := clobOrder{
 		Salt:          salt,
 		Maker:         makerAddr,
 		Signer:        p.walletAddress,
-		Taker:         "0x0000000000000000000000000000000000000000",
 		TokenID:       tokenBig,
 		MakerAmount:   makerAmtRaw,
 		TakerAmount:   takerAmtRaw,
-		Expiration:    big.NewInt(0),
-		Nonce:         big.NewInt(0),
-		FeeRateBps:    big.NewInt(0),
 		Side:          side,
 		SignatureType: sigType,
+		Timestamp:     nowMs,
+		Metadata:      zero32,
+		Builder:       zero32,
 	}
 
-	sig, err := signEIP712Order(order, p.privateKey)
+	p.mu.RLock()
+	negRisk := p.negRiskMarket
+	p.mu.RUnlock()
+
+	sig, err := signEIP712Order(order, p.privateKey, negRisk)
 	if err != nil {
 		return "", fmt.Errorf("EIP-712 sign failed: %w", err)
 	}
 
+	zeroBytes32Hex := "0x0000000000000000000000000000000000000000000000000000000000000000"
 	payload := clobOrderRequest{
 		Order: clobOrderJSON{
-			Salt:          salt.Int64(),
+			Salt:          salt.String(),
 			Maker:         makerAddr,
 			Signer:        p.walletAddress,
-			Taker:         "0x0000000000000000000000000000000000000000",
 			TokenID:       tokenID,
 			MakerAmount:   makerAmtRaw.String(),
 			TakerAmount:   takerAmtRaw.String(),
 			Expiration:    "0",
-			Nonce:         "0",
-			FeeRateBps:    "0",
 			Side:          sideStr,
 			SignatureType: p.creds.signatureType,
+			Timestamp:     nowMs.String(),
+			Metadata:      zeroBytes32Hex,
+			Builder:       zeroBytes32Hex,
 			Signature:     sig,
 		},
-		Owner:     p.creds.apiKey, // py-clob-client: owner is the API key, not an address
+		Owner:     p.creds.apiKey, // owner is the API key, not an address
 		OrderType: "FOK",
+		PostOnly:  false,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
