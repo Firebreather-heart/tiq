@@ -364,40 +364,52 @@ type clobOrderJSON struct {
 }
 
 // submitLiveBuyOrder sends a real BUY limit order to the Polymarket CLOB.
-// price must be on $0.01 tick ($0.35–$0.65). usdcAmount is the USDC spend.
-// Returns the CLOB order ID, or "" if the FOK cancelled (no fill).
-func (p *PolymarketEngine) submitLiveBuyOrder(tokenID string, price, usdcAmount float64) (string, error) {
-	return p.submitLiveOrder(tokenID, price, usdcAmount, 0, "BUY")
+// usdcBudget is the maximum USDC spend; the order is sized to whole shares at
+// the tick price so the signed limit price equals the intended entry price.
+// Returns the CLOB order ID, filled share count and actual USDC cost.
+func (p *PolymarketEngine) submitLiveBuyOrder(tokenID string, price, usdcBudget float64) (string, float64, float64, error) {
+	tickPrice := math.Round(price*100) / 100
+	if tickPrice <= 0 || tickPrice >= 1 {
+		return "", 0, 0, fmt.Errorf("price %.4f out of valid range (0,1) after rounding", tickPrice)
+	}
+	shares := math.Floor(usdcBudget / tickPrice)
+	if shares < 1 {
+		return "", 0, 0, fmt.Errorf("order too small: %.2f USDC at %.2f yields %.2f shares", usdcBudget, tickPrice, usdcBudget/tickPrice)
+	}
+	orderID, err := p.submitLiveOrder(tokenID, tickPrice, shares, 0, "BUY")
+	if err != nil {
+		return "", 0, 0, err
+	}
+	return orderID, shares, shares * tickPrice, nil
 }
 
 // submitLiveSellOrder sends a real SELL limit order to the Polymarket CLOB.
+// shares must not exceed the shares actually held (whole shares from the buy fill).
 func (p *PolymarketEngine) submitLiveSellOrder(tokenID string, price, shares float64) (string, error) {
-	usdcAmount := shares * price
-	return p.submitLiveOrder(tokenID, price, usdcAmount, 1, "SELL")
-}
-
-func (p *PolymarketEngine) submitLiveOrder(tokenID string, price, usdcAmount float64, side uint8, sideStr string) (string, error) {
-	if p.creds == nil || p.privateKey == nil {
-		return "", fmt.Errorf("live trading not initialized")
-	}
-
-	// Enforce $0.01 tick
 	tickPrice := math.Round(price*100) / 100
 	if tickPrice <= 0 || tickPrice >= 1 {
 		return "", fmt.Errorf("price %.4f out of valid range (0,1) after rounding", tickPrice)
 	}
+	wholeShares := math.Floor(shares)
+	if wholeShares < 1 {
+		return "", fmt.Errorf("sell too small: %.2f shares", shares)
+	}
+	return p.submitLiveOrder(tokenID, tickPrice, wholeShares, 1, "SELL")
+}
 
-	// Calculate shares: floor to 1-share precision
-	shares := math.Floor(usdcAmount / tickPrice)
-	if shares < 1 {
-		return "", fmt.Errorf("order too small: %.2f USDC at %.2f yields %.2f shares", usdcAmount, tickPrice, usdcAmount/tickPrice)
+// submitLiveOrder signs and posts a FOK order for a whole number of shares at
+// tickPrice (already rounded to the $0.01 tick by the callers above).
+func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares float64, side uint8, sideStr string) (string, error) {
+	if p.creds == nil || p.privateKey == nil {
+		return "", fmt.Errorf("live trading not initialized")
 	}
 
-	// Amounts in 6-decimal units.
+	// Amounts in 6-decimal units. USDC leg is shares*price so the implied
+	// limit price (makerAmount/takerAmount) is exactly the intended tick price.
 	// BUY:  maker gives USDC → receives shares.  makerAmt=USDC, takerAmt=shares.
 	// SELL: maker gives shares → receives USDC.  makerAmt=shares, takerAmt=USDC.
-	usdcRaw := new(big.Int).SetInt64(int64(math.Round(usdcAmount * 1e6)))
-	sharesRaw := new(big.Int).SetInt64(int64(shares * 1e6))
+	usdcRaw := new(big.Int).SetInt64(int64(math.Round(shares * tickPrice * 1e6)))
+	sharesRaw := new(big.Int).SetInt64(int64(math.Round(shares * 1e6)))
 	var makerAmtRaw, takerAmtRaw *big.Int
 	if side == 1 { // SELL
 		makerAmtRaw = sharesRaw

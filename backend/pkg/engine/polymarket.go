@@ -290,13 +290,23 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 	}
 
 	if p.liveTrading {
-		// Submit real FOK buy order to Polymarket CLOB
-		orderID, err := p.submitLiveBuyOrder(tokenID, currentPrice, cost)
+		// Submit real FOK buy order to Polymarket CLOB. The order is sized to
+		// whole shares, so replace the strategy's fractional units with the
+		// actual filled quantity (keeping the YES/NO sign) and deduct the real
+		// USDC spend — otherwise the later sell would try to move shares we
+		// never owned and the balance tracker would drift from the wallet.
+		orderID, filledShares, actualCost, err := p.submitLiveBuyOrder(tokenID, currentPrice, cost)
 		if err != nil {
 			return "", fmt.Errorf("[CLOB] Buy order failed: %w", err)
 		}
-		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE buy order filled. OrderID: %s | Token: %s | Price: $%.2f | USDC: $%.2f",
-			orderID, tokenID[:8]+"...", currentPrice, cost))
+		if units < 0 {
+			units = -filledShares
+		} else {
+			units = filledShares
+		}
+		cost = actualCost
+		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE buy order filled. OrderID: %s | Token: %s | Price: $%.2f | Shares: %.0f | USDC: $%.2f",
+			orderID, tokenID[:8]+"...", currentPrice, filledShares, actualCost))
 	} else {
 		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] Signed EIP-712 buy order for %s outcome. Wallet: %s", market, p.walletAddress))
 	}
