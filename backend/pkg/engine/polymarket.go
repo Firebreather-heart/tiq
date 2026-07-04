@@ -376,10 +376,6 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 		return nil
 	}
 
-	// Calculate realized profit/loss
-	// Payout is $1.00 USDC per share if won, but if sold back to order book early, we receive currentPrice
-	pnl := math.Abs(pos.Units) * (currentPrice - pos.OpenPrice)
-
 	if p.liveTrading {
 		tokenID := p.resolveTokenForClose(pos.Units)
 		if tokenID == "" {
@@ -388,15 +384,39 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 			p.store.Log("ERROR", fmt.Sprintf("[CLOB] Cannot sell %s: token IDs unknown (WS not yet subscribed). Position kept OPEN.", id))
 			return fmt.Errorf("CLOB sell skipped: token IDs unavailable for %s", id)
 		}
-		_, sellErr := p.submitLiveSellOrder(tokenID, currentPrice, math.Abs(pos.Units))
+
+		// Price the exit at the live best bid (marketable) so the FOK actually
+		// crosses — a stop-loss/TP sell limited at the trigger price frequently
+		// sits above the bid and gets killed, leaving the position stuck open
+		// and retrying every tick. Getting OUT is the priority on an exit, so we
+		// accept the bid (stop slippage is expected). Falls back to the trigger
+		// price only if the book read fails.
+		shares := math.Abs(pos.Units)
+		isYes := pos.Units > 0
+		sellPrice := currentPrice
+		if bid, fillable, mErr := p.GetMarketablePrice(isYes, 1, shares); mErr == nil && fillable {
+			sellPrice = bid
+			if bid < currentPrice {
+				p.store.Log("INFO", fmt.Sprintf("[CLOB] Exit %s: trigger $%.2f above best bid — selling marketable at $%.2f.", id, currentPrice, bid))
+			}
+		} else {
+			p.store.Log("WARN", fmt.Sprintf("[CLOB] Exit %s: live bid unavailable (fillable=%t, err=%v) — using trigger price $%.2f.", id, fillable, mErr, currentPrice))
+		}
+
+		_, sellErr := p.submitLiveSellOrder(tokenID, sellPrice, shares)
 		if sellErr != nil {
 			// CRITICAL: do NOT close locally — that would inflate the balance with USDC we never received.
 			p.store.Log("ERROR", fmt.Sprintf("[CLOB] SELL order for %s FAILED: %v — position kept OPEN to prevent balance inflation.", id, sellErr))
 			return fmt.Errorf("CLOB sell failed: %w", sellErr)
 		}
+		// The marketable bid is the effective fill price — record PnL against it.
+		currentPrice = sellPrice
 		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE sell filled. Token: %s | Price: $%.2f | Shares: %.2f",
-			tokenID[:8]+"...", currentPrice, math.Abs(pos.Units)))
+			tokenID[:8]+"...", currentPrice, shares))
 	}
+
+	// Realized P&L against the actual close price (marketable fill in live mode).
+	pnl := math.Abs(pos.Units) * (currentPrice - pos.OpenPrice)
 
 	// Refund balance + returns to Web3 wallet (local tracker)
 	accID := "polymarket_wallet_" + p.accountKey()
