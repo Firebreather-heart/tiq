@@ -387,17 +387,28 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 
 		// Price the exit at the live best bid (marketable) so the FOK actually
 		// crosses — a stop-loss/TP sell limited at the trigger price frequently
-		// sits above the bid and gets killed, leaving the position stuck open
-		// and retrying every tick. Getting OUT is the priority on an exit, so we
-		// accept the bid (stop slippage is expected). Falls back to the trigger
-		// price only if the book read fails.
+		// sits above the bid and gets killed, leaving the position stuck open.
+		// Getting OUT is the priority, so normal stop slippage is accepted.
+		//
+		// BUT cap the slippage: never sell more than maxExitSlippage below the
+		// trigger. If the bid has collapsed past the floor, we price at the floor
+		// instead — the FOK won't fill, the position stays open and retries,
+		// bounding the per-attempt loss rather than dumping at the bottom of a
+		// thin/transient dip. The 90s flatten passes the live price as its own
+		// trigger, so its floor sits below the bid and it still exits cleanly.
 		shares := math.Abs(pos.Units)
 		isYes := pos.Units > 0
+		floorPrice := currentPrice - maxExitSlippage
 		sellPrice := currentPrice
 		if bid, fillable, mErr := p.GetMarketablePrice(isYes, 1, shares); mErr == nil && fillable {
-			sellPrice = bid
-			if bid < currentPrice {
-				p.store.Log("INFO", fmt.Sprintf("[CLOB] Exit %s: trigger $%.2f above best bid — selling marketable at $%.2f.", id, currentPrice, bid))
+			if bid < floorPrice {
+				sellPrice = floorPrice
+				p.store.Log("INFO", fmt.Sprintf("[CLOB] Exit %s: best bid $%.2f is >$%.2f below trigger $%.2f — capping sell at floor $%.2f (won't dump the bottom; will retry).", id, bid, maxExitSlippage, currentPrice, floorPrice))
+			} else {
+				sellPrice = bid
+				if bid < currentPrice {
+					p.store.Log("INFO", fmt.Sprintf("[CLOB] Exit %s: trigger $%.2f above best bid — selling marketable at $%.2f.", id, currentPrice, bid))
+				}
 			}
 		} else {
 			p.store.Log("WARN", fmt.Sprintf("[CLOB] Exit %s: live bid unavailable (fillable=%t, err=%v) — using trigger price $%.2f.", id, fillable, mErr, currentPrice))
@@ -746,6 +757,11 @@ func stringsHasPrefix(s, prefix string) bool {
 // slPriceStaleAfter is how long a robust ("$20+ trade") SL price stays trusted before we
 // fall back to the live feed. Prevents a stale large-print price from gating the stop loss.
 const slPriceStaleAfter = 10 * time.Second
+
+// maxExitSlippage caps how far below the exit trigger a stop/TP sell will chase the
+// bid. Beyond this the FOK is priced at the floor (usually won't fill) so the position
+// holds and retries rather than dumping into a collapsing/transient-thin book.
+const maxExitSlippage = 0.10
 
 // priceKey normalizes a Polymarket instrument ("poly_<condID>_strike_..._expiry_...") down to
 // its stable condition-ID hex ("poly_<condID>"), so a strike value that drifts between ticks

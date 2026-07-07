@@ -645,13 +645,12 @@ type bookLevel struct {
 	size  float64
 }
 
-// fetchBookLevels returns one side of the live CLOB book, sorted most-aggressive
-// first: asks low→high (side 0, what a BUY consumes), bids high→low (side 1, what
-// a SELL consumes).
-func (p *PolymarketEngine) fetchBookLevels(tokenID string, side int) ([]bookLevel, error) {
+// fetchBook fetches the full live CLOB book for a token in one request and
+// returns both sides sorted most-aggressive first: bids high→low, asks low→high.
+func (p *PolymarketEngine) fetchBook(tokenID string) (bids, asks []bookLevel, err error) {
 	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(p.clobURL + "/book?token_id=" + tokenID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
@@ -661,24 +660,78 @@ func (p *PolymarketEngine) fetchBookLevels(tokenID string, side int) ([]bookLeve
 		Asks []struct{ Price, Size string } `json:"asks"`
 	}
 	if err := json.Unmarshal(body, &book); err != nil {
-		return nil, err
-	}
-	raw := book.Asks
-	if side == 1 {
-		raw = book.Bids
+		return nil, nil, err
 	}
 	pf := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
-	levels := make([]bookLevel, 0, len(raw))
-	for _, l := range raw {
-		levels = append(levels, bookLevel{pf(l.Price), pf(l.Size)})
+	for _, l := range book.Bids {
+		bids = append(bids, bookLevel{pf(l.Price), pf(l.Size)})
 	}
-	sort.Slice(levels, func(i, j int) bool {
-		if side == 1 {
-			return levels[i].price > levels[j].price
+	for _, l := range book.Asks {
+		asks = append(asks, bookLevel{pf(l.Price), pf(l.Size)})
+	}
+	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price }) // high→low
+	sort.Slice(asks, func(i, j int) bool { return asks[i].price < asks[j].price }) // low→high
+	return bids, asks, nil
+}
+
+// fetchBookLevels returns one side of the live CLOB book, sorted most-aggressive
+// first: asks (side 0, what a BUY consumes) or bids (side 1, what a SELL consumes).
+func (p *PolymarketEngine) fetchBookLevels(tokenID string, side int) ([]bookLevel, error) {
+	bids, asks, err := p.fetchBook(tokenID)
+	if err != nil {
+		return nil, err
+	}
+	if side == 1 {
+		return bids, nil
+	}
+	return asks, nil
+}
+
+// sweepPrice walks price levels (already sorted most-aggressive first)
+// accumulating size until `shares` is covered, returning the worst price
+// consumed and whether the depth exists.
+func sweepPrice(levels []bookLevel, shares float64) (worst float64, filled bool) {
+	var cum float64
+	for _, lvl := range levels {
+		cum += lvl.size
+		worst = lvl.price
+		if cum >= shares {
+			return worst, true
 		}
-		return levels[i].price < levels[j].price
-	})
-	return levels, nil
+	}
+	return worst, false
+}
+
+// EvaluateEntryBook reads the live book once and returns the top-of-book bid and
+// ask plus the marketable BUY price (ceil'd to tick) that fully fills `shares`.
+// ok is false when the book is one-sided or too thin — either way, not tradeable.
+// The strategy uses the bid/ask spread as a liquidity/sanity gate and the
+// marketable buy as the real executable entry price.
+func (p *PolymarketEngine) EvaluateEntryBook(isYes bool, shares float64) (bestBid, bestAsk, marketableBuy float64, ok bool, err error) {
+	p.mu.RLock()
+	tokenID := p.yesTokenID
+	if !isYes {
+		tokenID = p.noTokenID
+	}
+	p.mu.RUnlock()
+	if tokenID == "" {
+		return 0, 0, 0, false, fmt.Errorf("token id unavailable")
+	}
+
+	bids, asks, err := p.fetchBook(tokenID)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	if len(bids) == 0 || len(asks) == 0 {
+		return 0, 0, 0, false, nil // one-sided book — never trade into it
+	}
+	bestBid, bestAsk = bids[0].price, asks[0].price
+
+	sweep, filled := sweepPrice(asks, shares)
+	if !filled {
+		return bestBid, bestAsk, 0, false, nil // too thin to fill our size
+	}
+	return bestBid, bestAsk, math.Ceil(sweep*100) / 100, true, nil
 }
 
 // GetMarketablePrice reads the live CLOB book and returns the limit price at
@@ -702,18 +755,14 @@ func (p *PolymarketEngine) GetMarketablePrice(isYes bool, side int, shares float
 	if err != nil {
 		return 0, false, err
 	}
-	var cum, sweep float64
-	for _, lvl := range levels {
-		cum += lvl.size
-		sweep = lvl.price
-		if cum >= shares {
-			if side == 0 {
-				return math.Ceil(sweep*100) / 100, true, nil
-			}
-			return math.Floor(sweep*100) / 100, true, nil
-		}
+	sweep, filled := sweepPrice(levels, shares)
+	if !filled {
+		return 0, false, nil // book too thin for this size
 	}
-	return 0, false, nil // book too thin for this size
+	if side == 0 {
+		return math.Ceil(sweep*100) / 100, true, nil
+	}
+	return math.Floor(sweep*100) / 100, true, nil
 }
 
 // getCLOBBalance fetches the real USDC collateral balance from Polymarket CLOB.

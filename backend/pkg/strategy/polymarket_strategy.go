@@ -110,8 +110,11 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	// 1. Calculate True Probability of resolving YES using the Volatility Engine
 	// Volatility per second scaled down from standard 5m ATR
 	volatilityPerSec := (atr / currentPrice) / math.Sqrt(300.0)
-	if volatilityPerSec <= 0 {
-		volatilityPerSec = 0.0001 // Fallback floor
+	if volatilityPerSec < minVolPerSec {
+		// Floor prevents the Black-Scholes model from saturating to ~92% on a tiny
+		// spot-vs-strike gap when realized vol reads near zero. A near-zero vol made
+		// the model near-certain on a coin-flip strike and produced a fake $0.5 edge.
+		volatilityPerSec = minVolPerSec
 	}
 
 	// Calculate distance to strike (Black-Scholes d1-like probability distance)
@@ -173,17 +176,28 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	return nil
 }
 
-// enterLiveEdge re-evaluates a detected edge against the LIVE CLOB order book
-// before committing. The feed-derived EV that got us here uses a lagged
-// last-trade price; the real executable price can be well above it once
-// Polymarket has repriced. We fetch the marketable ask for our size and:
-//   - skip if the book is too thin to fill,
-//   - skip if the edge no longer clears the threshold at the real price
-//     (the lag already closed — filling here would overpay),
-//   - otherwise buy AT the marketable price so the FOK actually crosses.
+// Entry guardrails, added after a live loss where a mis-calibrated model bought a
+// collapsing token at a stale, wide-book ask ($0.65 for a token really worth
+// $0.25) and lost 15x the intended stop. Each gate below independently blocks
+// that trade. Values are tunable.
+const (
+	maxEntryEdge  = 0.20   // edge ceiling: a real latency lag is a few cents; a
+	                       // larger model-vs-market gap means our model is wrong.
+	maxBookSpread = 0.04   // reject wide/illiquid books (bestAsk-bestBid): buying
+	                       // the ask there marks us instantly at a far-lower bid.
+	maxTradeProb  = 0.80   // reject saturated model probabilities (near-certain
+	                       // reads on coin-flip strikes with ~zero vol).
+	minVolPerSec  = 0.0002 // volatility floor (see Tick): stops model saturation.
+)
+
+// enterLiveEdge re-evaluates a detected edge against the LIVE CLOB order book and
+// applies the entry guardrails before committing real capital. The feed-derived
+// EV that got us here uses a lagged, noisy last-trade price; we re-check against
+// the real book and refuse the trade unless it is genuinely a small, tradeable
+// latency lag on a tight two-sided book.
 //
-// isYes selects the token; feedPrice is the stale price used only for logging
-// and initial sizing; trueProb is the Black-Scholes fair probability.
+// isYes selects the token; feedPrice is the stale price (logging/initial sizing);
+// trueProb is the Black-Scholes fair probability.
 func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, trueProb, feedPrice, riskCapital float64) error {
 	side := "NO"
 	sign := -1.0
@@ -191,32 +205,67 @@ func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, t
 		side, sign = "YES", 1.0
 	}
 
+	// GATE (probability band): a saturated model probability near a coin-flip
+	// strike is exactly the untrustworthy kind — refuse it.
+	if trueProb > maxTradeProb {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s model prob %.0f%% saturated (> %.0f%%) — untrustworthy near-certain signal, skipping.", side, trueProb*100, maxTradeProb*100))
+		return nil
+	}
+
+	// GATE (probability band): a saturated model probability near a coin-flip
+	// strike is exactly the untrustworthy kind — refuse it before any book I/O.
+	if trueProb > maxTradeProb {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s model prob %.0f%% saturated (> %.0f%%) — untrustworthy near-certain signal, skipping.", side, trueProb*100, maxTradeProb*100))
+		return nil
+	}
+
 	estUnits := riskCapital / feedPrice
-	livePrice, fillable, err := pr.polyEngine.GetMarketablePrice(isYes, 0, estUnits)
-	if err != nil || !fillable {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s edge seen but live book unavailable/too thin (fillable=%t, err=%v) — skipping.", side, fillable, err))
+	bestBid, bestAsk, buyPrice, ok, err := pr.polyEngine.EvaluateEntryBook(isYes, estUnits)
+	if err != nil || !ok {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s edge seen but book one-sided/thin/unavailable (ok=%t, err=%v) — skipping.", side, ok, err))
 		return nil
 	}
 
-	liveEdge := trueProb - livePrice
-	if liveEdge < pr.cfg.MinExpectedValue {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s edge gone at LIVE ask $%.2f (feed showed $%.2f, live edge $%.2f < $%.2f) — Polymarket already repriced. Skipping.",
-			side, livePrice, feedPrice, liveEdge, pr.cfg.MinExpectedValue))
+	proceed, liveEdge, reason := checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, pr.cfg.MinExpectedValue)
+	if !proceed {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s entry blocked by guardrail: %s (bid $%.2f / ask $%.2f, buy $%.2f, feed $%.2f).",
+			side, reason, bestBid, bestAsk, buyPrice, feedPrice))
 		return nil
 	}
 
-	// Boundary guard against the real price, not the stale feed.
-	if livePrice < 0.35 || livePrice > 0.65 {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Live %s ask $%.2f outside $0.35–$0.65 boundary — skipping.", side, livePrice))
-		return nil
-	}
-
-	units := sign * riskCapital / livePrice
-	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] LIVE edge confirmed! Buying %.2f %s @ live ask $%.2f (edge $%.2f; feed said $%.2f). Risk $%.2f.",
-		math.Abs(units), side, livePrice, liveEdge, feedPrice, riskCapital))
+	units := sign * riskCapital / buyPrice
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] LIVE edge confirmed! Buying %.2f %s @ $%.2f (edge $%.2f; bid $%.2f / ask $%.2f; feed $%.2f). Risk $%.2f.",
+		math.Abs(units), side, buyPrice, liveEdge, bestBid, bestAsk, feedPrice, riskCapital))
 
 	// Scalp limits anchored to the real fill price: SL = entry-$0.03, TP = entry + 60% of live edge.
-	_, err = pr.polyEngine.OpenPosition(targetInstrument, units, livePrice, livePrice-0.03, livePrice+0.6*liveEdge)
+	_, err = pr.polyEngine.OpenPosition(targetInstrument, units, buyPrice, buyPrice-0.03, buyPrice+0.6*liveEdge)
 	return err
+}
+
+// checkEntryGates applies the pure entry guardrails (no I/O) and reports whether a
+// trade may proceed, the edge at the real executable price, and — when blocked —
+// the reason. Separated from enterLiveEdge so the thresholds are unit-testable.
+// The probability-band gate is applied by the caller before book I/O.
+func checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, minEdge float64) (proceed bool, edge float64, reason string) {
+	// Book sanity: a wide spread is an illiquid/unstable book; buying the ask
+	// marks us instantly at the far-lower bid.
+	if spread := bestAsk - bestBid; spread > maxBookSpread {
+		return false, 0, fmt.Sprintf("book too wide (spread $%.2f > $%.2f)", spread, maxBookSpread)
+	}
+	edge = trueProb - buyPrice
+	// Edge floor: the lag must still exist at the real price.
+	if edge < minEdge {
+		return false, edge, fmt.Sprintf("edge $%.2f below min $%.2f — repriced", edge, minEdge)
+	}
+	// Edge ceiling: an outsized edge is a model-vs-market disagreement (bad
+	// vol/strike), not a latency lag. Strongest block on the loss trade.
+	if edge > maxEntryEdge {
+		return false, edge, fmt.Sprintf("edge $%.2f exceeds max $%.2f — implausible model/market gap", edge, maxEntryEdge)
+	}
+	// Boundary on the real price.
+	if buyPrice < 0.35 || buyPrice > 0.65 {
+		return false, edge, fmt.Sprintf("price $%.2f outside $0.35–$0.65 boundary", buyPrice)
+	}
+	return true, edge, ""
 }
 
