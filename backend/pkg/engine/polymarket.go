@@ -1,8 +1,8 @@
 package engine
 
 import (
-	crand "crypto/rand"
 	"crypto/ecdsa"
+	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -83,6 +83,7 @@ type PolymarketEngine struct {
 	slPrices            map[string]float64   // Separate price feed for SL checking, only updated by trades >= $20 USDC
 	slPriceTimes        map[string]time.Time // Last update time of each slPrices entry (for staleness fallback)
 	slStates            map[string]time.Time // Track first breached timestamp for each position ID
+	lastStopCloseTime   map[string]time.Time // condition-ID -> time of last stop-loss close (re-entry cooldown)
 	rpcURL              string
 	clobURL             string
 	yesTokenID          string
@@ -152,19 +153,20 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 	}
 
 	engine := &PolymarketEngine{
-		store:         store,
-		walletAddress: signerAddr, // signer EOA (signs orders, L1/L2 auth)
-		funderAddress: funderAddr, // proxy wallet (holds USDC, set as maker in orders)
-		privateKey:    privKey,
-		creds:         creds,
-		liveTrading:   isLive,
-		prices:        make(map[string]float64),
-		slPrices:      make(map[string]float64),
-		slPriceTimes:  make(map[string]time.Time),
-		slStates:      make(map[string]time.Time),
-		rpcURL:        rpcURL,
-		clobURL:       "https://clob.polymarket.com",
-		keyMgr:        km,
+		store:             store,
+		walletAddress:     signerAddr, // signer EOA (signs orders, L1/L2 auth)
+		funderAddress:     funderAddr, // proxy wallet (holds USDC, set as maker in orders)
+		privateKey:        privKey,
+		creds:             creds,
+		liveTrading:       isLive,
+		prices:            make(map[string]float64),
+		slPrices:          make(map[string]float64),
+		slPriceTimes:      make(map[string]time.Time),
+		slStates:          make(map[string]time.Time),
+		lastStopCloseTime: make(map[string]time.Time),
+		rpcURL:            rpcURL,
+		clobURL:           "https://clob.polymarket.com",
+		keyMgr:            km,
 	}
 
 	// Sync real CLOB balance on startup (live only)
@@ -220,7 +222,7 @@ func (p *PolymarketEngine) GetBalance() (float64, float64, error) {
 			if !exists {
 				currentPrice = pos.OpenPrice
 			}
-			
+
 			// Value of shares = number of shares * current share price
 			equity += math.Abs(pos.Units) * currentPrice
 		}
@@ -321,14 +323,14 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 	_, _ = crand.Read(randSuffix)
 	posID := fmt.Sprintf("poly_%d_%s", time.Now().UnixNano(), hex.EncodeToString(randSuffix))
 	pos := db.Position{
-		ID:          posID,
-		Instrument:  market,
-		Units:       units,
-		OpenPrice:   currentPrice,
-		OpenTime:    time.Now(),
-		StopLoss:    stopLoss,
-		TakeProfit:  takeProfit,
-		Status:      "OPEN",
+		ID:         posID,
+		Instrument: market,
+		Units:      units,
+		OpenPrice:  currentPrice,
+		OpenTime:   time.Now(),
+		StopLoss:   stopLoss,
+		TakeProfit: takeProfit,
+		Status:     "OPEN",
 	}
 	err = p.store.SavePosition(pos)
 	if err != nil {
@@ -459,7 +461,7 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 	})
 
 	p.store.Log("INFO", fmt.Sprintf("[Polymarket] Sold %.2f shares of %s early at $%.2f USDC/share. Realized PnL: $%.2f USDC", math.Abs(pos.Units), pos.Instrument, currentPrice, pnl))
-	
+
 	// Clean up Stop Loss state
 	p.mu.Lock()
 	delete(p.slStates, id)
@@ -636,7 +638,7 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		// 1. Expiration check: check if expiration time is reached
 		if time.Now().Unix() >= expiryUnix {
 			p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Live Contract Expiration Reached for %s. Resolving...", pos.ID))
-			
+
 			// Get current spot price of BTC
 			spotPrice, hasSpot := p.GetPrice("BTC_USD")
 			if !hasSpot {
@@ -645,7 +647,7 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 
 			isLong := pos.Units > 0
 			resolutionPrice := 0.0
-			
+
 			if isLong {
 				if spotPrice >= strike {
 					resolutionPrice = 1.0 // YES won!
@@ -720,13 +722,18 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 			p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Stop Loss triggered (Price: $%.4f <= Trigger: $%.4f). Closing at SL trigger price.", slPrice, slTrigger))
 			p.mu.Lock()
 			delete(p.slStates, pos.ID)
+			// Start the re-entry cooldown for this contract (see InCooldown): a stop-out
+			// often means a directional move is still running, and re-entering
+			// immediately just buys back into the same move (observed 6 stop-outs on
+			// one contract in ~15s before this was added).
+			p.lastStopCloseTime[conditionID(pos.Instrument)] = time.Now()
 			p.mu.Unlock()
 			_ = p.ClosePosition(pos.ID, slTrigger)
 			continue
 		}
 
 		// 3. Take Profit check: if current token price meets or exceeds target predicted probability, sell/exit early to lock in profits
-		checkTP:
+	checkTP:
 		if pos.TakeProfit > 0 && price >= pos.TakeProfit {
 			p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Take Profit triggered (Current Share Price: $%.2f >= Predicted Target: $%.2f). Locking in profit.", price, pos.TakeProfit))
 			p.mu.Lock()
@@ -762,6 +769,41 @@ const slPriceStaleAfter = 10 * time.Second
 // bid. Beyond this the FOK is priced at the floor (usually won't fill) so the position
 // holds and retries rather than dumping into a collapsing/transient-thin book.
 const maxExitSlippage = 0.10
+
+// reentryCooldown blocks re-entering the same contract for this long after a
+// stop-loss close. A stop-out is often a sign the underlying move is still
+// running; re-entering the same contract seconds later just buys back into it.
+// Observed: 6 stop-outs on one contract in ~15s (-$2.34) before this existed.
+const reentryCooldown = 25 * time.Second
+
+// conditionID extracts the stable per-contract identifier from an instrument
+// string ("poly_<condID>_strike_..._expiry_..."), so cooldown/dedup checks
+// survive the strike value drifting slightly between ticks (same pattern used
+// elsewhere to match "is this the same contract" — see strategy Tick's
+// currentCondID).
+func conditionID(instrument string) string {
+	parts := strings.Split(instrument, "_")
+	if len(parts) >= 2 {
+		return parts[1]
+	}
+	return instrument
+}
+
+// InCooldown reports whether the contract behind `instrument` is still within
+// the post-stop-loss re-entry cooldown, and how much time remains.
+func (p *PolymarketEngine) InCooldown(instrument string) (remaining time.Duration, active bool) {
+	p.mu.RLock()
+	t, ok := p.lastStopCloseTime[conditionID(instrument)]
+	p.mu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	elapsed := time.Since(t)
+	if elapsed >= reentryCooldown {
+		return 0, false
+	}
+	return reentryCooldown - elapsed, true
+}
 
 // priceKey normalizes a Polymarket instrument ("poly_<condID>_strike_..._expiry_...") down to
 // its stable condition-ID hex ("poly_<condID>"), so a strike value that drifts between ticks
@@ -961,7 +1003,7 @@ func (p *PolymarketEngine) handleWSMessage(msg []byte) {
 		}
 		p.mu.Unlock()
 
-		p.store.Log("INFO", fmt.Sprintf("[Polymarket WS] Executed Trade print: %s outcome at $%.3f (Size: %s shares / $%.2f USDC, Side: %s)", 
+		p.store.Log("INFO", fmt.Sprintf("[Polymarket WS] Executed Trade print: %s outcome at $%.3f (Size: %s shares / $%.2f USDC, Side: %s)",
 			outcome, price, sizeStr, usdAmount, side))
 
 		// Immediately evaluate positions
@@ -1093,7 +1135,7 @@ func (p *PolymarketEngine) handleStructWSMessage(msg []byte, yesToken, noToken s
 	}
 	p.mu.Unlock()
 
-	p.store.Log("INFO", fmt.Sprintf("[Struct WS] Executed Trade print: %s outcome at $%.3f (Size: $%.2f USDC, Side: %s)", 
+	p.store.Log("INFO", fmt.Sprintf("[Struct WS] Executed Trade print: %s outcome at $%.3f (Size: $%.2f USDC, Side: %s)",
 		outcome, price, trade.UsdAmount, trade.Side))
 
 	// Immediately evaluate positions

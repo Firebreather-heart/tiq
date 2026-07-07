@@ -11,17 +11,17 @@ import (
 )
 
 type PolymarketConfig struct {
-	MarketAddress   string  `json:"market_address"`   // Polymarket target smart contract address
-	StrikePrice     float64 `json:"strike_price"`     // Target price (e.g., $71,200)
-	ExpirationTime  time.Time `json:"expiration_time"` // Target expiry timestamp
-	MinExpectedValue float64 `json:"min_expected_value"` // Minimum EV edge required (e.g., $0.05)
-	RiskPercent     float64 `json:"risk_percent"`     // USDC wallet percent to risk per trade
+	MarketAddress    string    `json:"market_address"`     // Polymarket target smart contract address
+	StrikePrice      float64   `json:"strike_price"`       // Target price (e.g., $71,200)
+	ExpirationTime   time.Time `json:"expiration_time"`    // Target expiry timestamp
+	MinExpectedValue float64   `json:"min_expected_value"` // Minimum EV edge required (e.g., $0.05)
+	RiskPercent      float64   `json:"risk_percent"`       // USDC wallet percent to risk per trade
 }
 
 type PolymarketRunner struct {
-	cfg          PolymarketConfig
-	store        *db.DB
-	polyEngine   *engine.PolymarketEngine
+	cfg        PolymarketConfig
+	store      *db.DB
+	polyEngine *engine.PolymarketEngine
 }
 
 func NewPolymarketRunner(cfg PolymarketConfig, store *db.DB, polyEng *engine.PolymarketEngine) *PolymarketRunner {
@@ -119,12 +119,12 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 
 	// Calculate distance to strike (Black-Scholes d1-like probability distance)
 	d := math.Log(currentPrice/pr.cfg.StrikePrice) / (volatilityPerSec * math.Sqrt(timeRemaining))
-	
+
 	// Cumulative Normal Distribution gives the probability of YES
 	trueYesProbability := 0.5 * (1.0 + math.Erf(d/math.Sqrt(2.0)))
 	trueNoProbability := 1.0 - trueYesProbability
 
-	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Calculated Probability: YES=%.1f%%, NO=%.1f%% (Realized Volatility: %.4f%%)", 
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Calculated Probability: YES=%.1f%%, NO=%.1f%% (Realized Volatility: %.4f%%)",
 		trueYesProbability*100, trueNoProbability*100, volatilityPerSec*100))
 
 	// 3. Evaluate Expected Value (EV)
@@ -139,9 +139,9 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 		targetInstrument:     marketYesPrice,
 	})
 
-	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Market share prices: YES=$%.2f USDC, NO=$%.2f USDC", 
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Market share prices: YES=$%.2f USDC, NO=$%.2f USDC",
 		marketYesPrice, marketNoPrice))
-	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Expected Value Edge: YES=+$%.2f USDC, NO=+$%.2f USDC", 
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Expected Value Edge: YES=+$%.2f USDC, NO=+$%.2f USDC",
 		yesEV, noEV))
 
 	// 4. expected value calculations already completed. Skip check since it was moved to the top.
@@ -181,13 +181,13 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 // $0.25) and lost 15x the intended stop. Each gate below independently blocks
 // that trade. Values are tunable.
 const (
-	maxEntryEdge  = 0.20   // edge ceiling: a real latency lag is a few cents; a
-	                       // larger model-vs-market gap means our model is wrong.
-	maxBookSpread = 0.04   // reject wide/illiquid books (bestAsk-bestBid): buying
-	                       // the ask there marks us instantly at a far-lower bid.
-	maxTradeProb  = 0.80   // reject saturated model probabilities (near-certain
-	                       // reads on coin-flip strikes with ~zero vol).
-	minVolPerSec  = 0.0002 // volatility floor (see Tick): stops model saturation.
+	maxEntryEdge = 0.20 // edge ceiling: a real latency lag is a few cents; a
+	// larger model-vs-market gap means our model is wrong.
+	maxBookSpread = 0.04 // reject wide/illiquid books (bestAsk-bestBid): buying
+	// the ask there marks us instantly at a far-lower bid.
+	maxTradeProb = 0.80 // reject saturated model probabilities (near-certain
+	// reads on coin-flip strikes with ~zero vol).
+	minVolPerSec = 0.0002 // volatility floor (see Tick): stops model saturation.
 )
 
 // enterLiveEdge re-evaluates a detected edge against the LIVE CLOB order book and
@@ -203,6 +203,15 @@ func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, t
 	sign := -1.0
 	if isYes {
 		side, sign = "YES", 1.0
+	}
+
+	// GATE (re-entry cooldown): refuse to re-enter this contract right after a
+	// stop-loss closed a position on it. A stop-out often means the underlying
+	// move is still running; re-entering immediately just buys back into it.
+	// Checked first — cheapest gate, no book I/O.
+	if remaining, active := pr.polyEngine.InCooldown(targetInstrument); active {
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s entry blocked: contract in re-entry cooldown (%.0fs remaining after a recent stop-loss).", side, remaining.Seconds()))
+		return nil
 	}
 
 	// GATE (probability band): a saturated model probability near a coin-flip
@@ -268,4 +277,3 @@ func checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, minEdge float64) (pro
 	}
 	return true, edge, ""
 }
-
