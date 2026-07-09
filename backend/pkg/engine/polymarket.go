@@ -94,6 +94,8 @@ type PolymarketEngine struct {
 	accountMu           sync.Mutex // Serializes wallet balance + position open/close (prevents double-close/double-refund races)
 	structMu            sync.Mutex // Protects structConn lifecycle (connect on OpenPosition, close on ClosePosition)
 	keyMgr              *structKeyManager
+	bookCache           map[string]cachedBook // tokenID -> short-lived order-book snapshot (see fetchBook)
+	bookCacheMu         sync.Mutex
 }
 
 func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*PolymarketEngine, error) {
@@ -160,6 +162,7 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 		prices:            make(map[string]float64),
 		slStates:          make(map[string]time.Time),
 		lastStopCloseTime: make(map[string]time.Time),
+		bookCache:         make(map[string]cachedBook),
 		rpcURL:            rpcURL,
 		clobURL:           "https://clob.polymarket.com",
 		keyMgr:            km,
@@ -612,7 +615,8 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		}
 
 		// 0. Scalp flatten: never ride a scalp into settlement (binary $0/$1 gap risk).
-		// Force-close 90s before expiry at the live token price.
+		// Force-close 90s before expiry, priced from the live book (same reasoning as
+		// the SL/TP check below: the tape can misstate the position's real value).
 		if expiryUnix-time.Now().Unix() <= 90 {
 			p.mu.RLock()
 			yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
@@ -621,6 +625,9 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 				closePx := yesPx
 				if pos.Units < 0 {
 					closePx = 1.0 - yesPx
+				}
+				if bp, ok, err := p.GetMarketablePrice(pos.Units > 0, 1, math.Abs(pos.Units)); err == nil && ok {
+					closePx = bp
 				}
 				p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Scalp flatten: %ds to expiry (<=90s). Closing %s at $%.3f to avoid settlement risk.", expiryUnix-time.Now().Unix(), pos.ID, closePx))
 				p.mu.Lock()
@@ -868,6 +875,14 @@ func (p *PolymarketEngine) SubscribeToMarketTokens(yesToken, noToken, marketAddr
 	for k := range p.prices {
 		if strings.HasPrefix(k, "poly_") && k != activeKey {
 			delete(p.prices, k)
+		}
+	}
+	// Same bound for the re-entry cooldown map: an entry past reentryCooldown can never
+	// affect InCooldown again, so it's safe (and keeps this from growing for the life
+	// of the process — a new contract rolls around every ~5 minutes, forever).
+	for k, t := range p.lastStopCloseTime {
+		if time.Since(t) > reentryCooldown {
+			delete(p.lastStopCloseTime, k)
 		}
 	}
 

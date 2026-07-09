@@ -38,7 +38,7 @@ const (
 
 // Order side constants
 const (
-	sideYES = 0 // BUY
+	sideYES  = 0 // BUY
 	sideSELL = 1
 )
 
@@ -647,8 +647,33 @@ type bookLevel struct {
 
 // fetchBook fetches the full live CLOB book for a token in one request and
 // returns both sides sorted most-aggressive first: bids high→low, asks low→high.
+// bookCacheTTL bounds how often fetchBook actually hits the CLOB REST endpoint.
+// EvaluatePositionTriggers is invoked once per second by a ticker AND once per
+// incoming WS trade print (which can arrive several times a second on an active
+// contract) — without this, an open position could trigger many redundant book
+// fetches per second, risking CLOB rate-limiting and, if calls start timing out
+// under our own self-inflicted load, silently degrading back to the noisy tape
+// fallback this cache exists to avoid. 300ms keeps the price effectively
+// real-time for a 3-cent scalp stop while capping call frequency.
+const bookCacheTTL = 300 * time.Millisecond
+
+type cachedBook struct {
+	bids, asks []bookLevel
+	fetchedAt  time.Time
+}
+
 func (p *PolymarketEngine) fetchBook(tokenID string) (bids, asks []bookLevel, err error) {
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(p.clobURL + "/book?token_id=" + tokenID)
+	p.bookCacheMu.Lock()
+	if c, ok := p.bookCache[tokenID]; ok && time.Since(c.fetchedAt) < bookCacheTTL {
+		bids, asks = c.bids, c.asks
+		p.bookCacheMu.Unlock()
+		return bids, asks, nil
+	}
+	p.bookCacheMu.Unlock()
+
+	// Tightened from 5s: this now runs up to several times/sec via the trigger
+	// loop, so a single hung request must not be able to stall it for that long.
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Get(p.clobURL + "/book?token_id=" + tokenID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -671,6 +696,11 @@ func (p *PolymarketEngine) fetchBook(tokenID string) (bids, asks []bookLevel, er
 	}
 	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price }) // high→low
 	sort.Slice(asks, func(i, j int) bool { return asks[i].price < asks[j].price }) // low→high
+
+	p.bookCacheMu.Lock()
+	p.bookCache[tokenID] = cachedBook{bids: bids, asks: asks, fetchedAt: time.Now()}
+	p.bookCacheMu.Unlock()
+
 	return bids, asks, nil
 }
 
@@ -907,4 +937,3 @@ func loadLiveCredentials() (key *ecdsa.PrivateKey, signerAddr, funderAddr string
 
 	return key, signerAddr, funderAddr, creds, nil
 }
-
