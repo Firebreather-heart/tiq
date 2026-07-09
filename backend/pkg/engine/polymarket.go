@@ -80,8 +80,6 @@ type PolymarketEngine struct {
 	creds               *polymarketCredentials // non-nil when POLY_LIVE=true
 	liveTrading         bool                   // true when POLY_LIVE=true and credentials loaded
 	prices              map[string]float64
-	slPrices            map[string]float64   // Separate price feed for SL checking, only updated by trades >= $20 USDC
-	slPriceTimes        map[string]time.Time // Last update time of each slPrices entry (for staleness fallback)
 	slStates            map[string]time.Time // Track first breached timestamp for each position ID
 	lastStopCloseTime   map[string]time.Time // condition-ID -> time of last stop-loss close (re-entry cooldown)
 	rpcURL              string
@@ -160,8 +158,6 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 		creds:             creds,
 		liveTrading:       isLive,
 		prices:            make(map[string]float64),
-		slPrices:          make(map[string]float64),
-		slPriceTimes:      make(map[string]time.Time),
 		slStates:          make(map[string]time.Time),
 		lastStopCloseTime: make(map[string]time.Time),
 		rpcURL:            rpcURL,
@@ -670,40 +666,38 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 			continue
 		}
 
-		// Fetch price for general tracking and Take Profit
+		// Fetch the tape price as a last-resort fallback only (see below).
 		key := priceKey(pos.Instrument)
 		p.mu.RLock()
 		yesPrice, exists := p.prices[key]
-		// Fetch price for Stop Loss (robust SL price feed) plus its freshness
-		slYesPrice, slExists := p.slPrices[key]
-		slUpdatedAt, slHasTime := p.slPriceTimes[key]
 		p.mu.RUnlock()
 
 		if !exists {
 			continue
 		}
-		// Use the robust SL price only if present AND fresh; otherwise fall back to the live
-		// feed so a stale large-print price can't suppress (or wrongly trigger) the stop.
-		slStale := !slHasTime || time.Since(slUpdatedAt) > slPriceStaleAfter
-		if !slExists || slStale {
-			if slExists && slStale {
-				p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Robust SL price for %s is stale (%.0fs old > %.0fs). Falling back to live feed for stop check.",
-					pos.ID, time.Since(slUpdatedAt).Seconds(), slPriceStaleAfter.Seconds()))
+
+		// Price the position against the LIVE ORDER BOOK, not the raw trade tape — a
+		// single $1-2 print can swing the tape 10+ cents in a couple of seconds without
+		// the real book moving at all (confirmed after a run of sub-second "stop-loss"
+		// closes that fired on tape noise while the book itself sat stable). This is the
+		// exact same call ClosePosition uses to price the actual exit, so the decision to
+		// close and the price we get now agree, instead of triggering on one source and
+		// executing against another.
+		shares := math.Abs(pos.Units)
+		isYes := pos.Units > 0
+		bookPrice, fillable, bookErr := p.GetMarketablePrice(isYes, 1, shares) // side=1: SELL/bids
+		if bookErr != nil || !fillable {
+			// Book unreachable or too thin to price our size — fall back to the tape
+			// rather than skip the check (still better than no SL protection at all).
+			bookPrice = yesPrice
+			if pos.Units < 0 {
+				bookPrice = 1.0 - yesPrice
 			}
-			slYesPrice = yesPrice // Fallback to standard price if no robust SL price yet, or it went stale
 		}
 
-		// The price of our owned share token for TP
-		price := yesPrice
-		if pos.Units < 0 {
-			price = 1.0 - yesPrice
-		}
-
-		// The price of our owned share token for SL checking
-		slPrice := slYesPrice
-		if pos.Units < 0 {
-			slPrice = 1.0 - slYesPrice
-		}
+		// The price of our owned share token, used for both TP and SL checks.
+		price := bookPrice
+		slPrice := bookPrice
 
 		// 2. Stop Loss check: close immediately when price breaches the trigger.
 		// No confirmation timer — a 3-cent scalp stop has no room for delay; waiting
@@ -760,10 +754,6 @@ func (p *PolymarketEngine) accountKey() string {
 func stringsHasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
-
-// slPriceStaleAfter is how long a robust ("$20+ trade") SL price stays trusted before we
-// fall back to the live feed. Prevents a stale large-print price from gating the stop loss.
-const slPriceStaleAfter = 10 * time.Second
 
 // maxExitSlippage caps how far below the exit trigger a stop/TP sell will chase the
 // bid. Beyond this the FOK is priced at the floor (usually won't fill) so the position
@@ -878,8 +868,6 @@ func (p *PolymarketEngine) SubscribeToMarketTokens(yesToken, noToken, marketAddr
 	for k := range p.prices {
 		if strings.HasPrefix(k, "poly_") && k != activeKey {
 			delete(p.prices, k)
-			delete(p.slPrices, k)
-			delete(p.slPriceTimes, k)
 		}
 	}
 
@@ -996,11 +984,6 @@ func (p *PolymarketEngine) handleWSMessage(msg []byte) {
 		key := priceKey(marketAddr)
 		p.mu.Lock()
 		p.prices[key] = yesPrice
-		// Only update robust SL price feed if trade is >= $20 USDC
-		if usdAmount >= 20.0 {
-			p.slPrices[key] = yesPrice
-			p.slPriceTimes[key] = time.Now()
-		}
 		p.mu.Unlock()
 
 		p.store.Log("INFO", fmt.Sprintf("[Polymarket WS] Executed Trade print: %s outcome at $%.3f (Size: %s shares / $%.2f USDC, Side: %s)",
@@ -1128,11 +1111,6 @@ func (p *PolymarketEngine) handleStructWSMessage(msg []byte, yesToken, noToken s
 	key := priceKey(marketAddr)
 	p.mu.Lock()
 	p.prices[key] = yesPrice
-	// Only update robust SL price feed if trade is >= $20 USDC
-	if trade.UsdAmount >= 20.0 {
-		p.slPrices[key] = yesPrice
-		p.slPriceTimes[key] = time.Now()
-	}
 	p.mu.Unlock()
 
 	p.store.Log("INFO", fmt.Sprintf("[Struct WS] Executed Trade print: %s outcome at $%.3f (Size: $%.2f USDC, Side: %s)",
