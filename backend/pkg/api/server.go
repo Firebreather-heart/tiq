@@ -82,13 +82,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"runner_config":  s.runner.GetConfig(),
-		"environment":    s.engine.GetEnvironment(),
-		"mode":           mode,
-		"balance":        bal,
-		"equity":         eq,
-		"timestamp":      time.Now(),
-		"active_market":  polyInfo,
+		"runner_config": s.runner.GetConfig(),
+		"environment":   s.engine.GetEnvironment(),
+		"mode":          mode,
+		"balance":       bal,
+		"equity":        eq,
+		"timestamp":     time.Now(),
+		"active_market": polyInfo,
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
@@ -98,6 +98,26 @@ func (s *Server) handleConfigUpdate(w http.ResponseWriter, r *http.Request) {
 	var req strategy.Config
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeJSONError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	// Basic sanity bounds — a negative/zero period or risk percent doesn't currently
+	// reach Polymarket trading (fixed $5 risk sizing), but would corrupt the stored
+	// config for the OANDA/manual-trading path and any future use of these fields.
+	if req.RiskPercent <= 0 || req.RiskPercent > 100 {
+		s.writeJSONError(w, http.StatusBadRequest, "risk_percent must be between 0 and 100")
+		return
+	}
+	if req.AtrMultiplier <= 0 || req.TpMultiplier <= 0 {
+		s.writeJSONError(w, http.StatusBadRequest, "atr_multiplier and tp_multiplier must be positive")
+		return
+	}
+	if req.EmaFastPeriod <= 0 || req.EmaSlowPeriod <= 0 || req.RsiPeriod <= 0 {
+		s.writeJSONError(w, http.StatusBadRequest, "ema_fast_period, ema_slow_period, and rsi_period must be positive")
+		return
+	}
+	if req.EmaFastPeriod >= req.EmaSlowPeriod {
+		s.writeJSONError(w, http.StatusBadRequest, "ema_fast_period must be less than ema_slow_period")
 		return
 	}
 
@@ -143,7 +163,6 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInferences(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, []string{})
 }
-
 
 func (s *Server) handleManualTrade(w http.ResponseWriter, r *http.Request) {
 	type ManualTradeReq struct {
@@ -197,14 +216,23 @@ func (s *Server) handleClosePosition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.PositionID == "" || req.CurrentPrice == 0 {
-		s.writeJSONError(w, http.StatusBadRequest, "Missing required parameters (position_id, current_price)")
+	if req.PositionID == "" {
+		s.writeJSONError(w, http.StatusBadRequest, "Missing required parameter (position_id)")
 		return
 	}
 
-	// For Polymarket binary tokens, price must be within (0, 1).
+	isPoly := strings.HasPrefix(req.PositionID, "poly_")
+
+	// A Polymarket token can legitimately settle/crash to exactly $0.00 — only reject a
+	// zero price as "missing" for non-Polymarket engines, where 0 is never a real price.
+	if !isPoly && req.CurrentPrice == 0 {
+		s.writeJSONError(w, http.StatusBadRequest, "Missing required parameter (current_price)")
+		return
+	}
+
+	// For Polymarket binary tokens, price must be within [0, 1] (0 and 1 are valid).
 	// Reject out-of-range values to prevent manual balance manipulation.
-	if strings.HasPrefix(req.PositionID, "poly_") && (req.CurrentPrice < 0 || req.CurrentPrice > 1) {
+	if isPoly && (req.CurrentPrice < 0 || req.CurrentPrice > 1) {
 		s.writeJSONError(w, http.StatusBadRequest, "current_price must be between 0 and 1 for Polymarket positions")
 		return
 	}
