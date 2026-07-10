@@ -53,6 +53,19 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 		currentCondID = parts[1]
 	}
 
+	// Structured book snapshot for offline persistence/momentum analysis. Logs the REAL
+	// top-of-book (not the noisy last-trade tape) once per tick, tagged by condition ID
+	// so a future check can build a clean same-contract time series directly via SQL
+	// filtering on "cond=<id>", instead of reconstructing it from ambiguous trade-print
+	// logs after the fact (which is why our first attempt at this analysis was
+	// inconclusive — most trades had too few usable, unambiguously-same-contract points).
+	if yBid, yAsk, ok1 := pr.polyEngine.GetTopOfBook(true); ok1 {
+		if nBid, nAsk, ok2 := pr.polyEngine.GetTopOfBook(false); ok2 {
+			pr.store.Log("INFO", fmt.Sprintf("[BookSnapshot] cond=%s t_remain=%.0f yes_bid=%.3f yes_ask=%.3f no_bid=%.3f no_ask=%.3f",
+				currentCondID, timeRemaining, yBid, yAsk, nBid, nAsk))
+		}
+	}
+
 	for _, pos := range openShares {
 		posParts := strings.Split(pos.Instrument, "_")
 		if len(posParts) >= 2 && posParts[1] == currentCondID {

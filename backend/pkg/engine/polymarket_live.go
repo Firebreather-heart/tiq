@@ -795,6 +795,27 @@ func (p *PolymarketEngine) GetMarketablePrice(isYes bool, side int, shares float
 	return math.Floor(sweep*100) / 100, true, nil
 }
 
+// GetTopOfBook returns the best bid/ask for a token (no sweep, no size needed) —
+// a lightweight read for logging/diagnostics. Benefits from fetchBook's 300ms
+// cache, so calling this once per strategy tick adds negligible load: distinct
+// from GetMarketablePrice, which sweeps for a specific fillable size.
+func (p *PolymarketEngine) GetTopOfBook(isYes bool) (bestBid, bestAsk float64, ok bool) {
+	p.mu.RLock()
+	tokenID := p.yesTokenID
+	if !isYes {
+		tokenID = p.noTokenID
+	}
+	p.mu.RUnlock()
+	if tokenID == "" {
+		return 0, 0, false
+	}
+	bids, asks, err := p.fetchBook(tokenID)
+	if err != nil || len(bids) == 0 || len(asks) == 0 {
+		return 0, 0, false
+	}
+	return bids[0].price, asks[0].price, true
+}
+
 // getCLOBBalance fetches the real USDC collateral balance from Polymarket CLOB.
 // Endpoint: GET /balance-allowance?asset_type=COLLATERAL&signature_type=N.
 // The HMAC signs the bare path (no query string), matching py-clob-client.
