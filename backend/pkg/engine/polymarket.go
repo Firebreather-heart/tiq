@@ -312,8 +312,13 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] Signed EIP-712 buy order for %s outcome. Wallet: %s", market, p.walletAddress))
 	}
 
+	// Taker fee on the entry leg (see cryptoTakerFeeRate) — computed from the final
+	// units so a live fill's actual filled size is what gets charged, not the estimate.
+	entryFee := takerFee(math.Abs(units), currentPrice)
+
 	// Deduct USDC from local balance tracker (both live and paper)
 	acc.Balance -= cost
+	acc.Balance -= entryFee
 	acc.UpdatedAt = time.Now()
 	_ = p.store.SaveAccount(acc)
 
@@ -427,14 +432,21 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 			tokenID[:8]+"...", currentPrice, shares))
 	}
 
-	// Realized P&L against the actual close price (marketable fill in live mode).
-	pnl := math.Abs(pos.Units) * (currentPrice - pos.OpenPrice)
+	// Realized P&L against the actual close price (marketable fill in live mode),
+	// net of taker fees on both legs. Entry fee isn't stored on the position record;
+	// it's cheap and exact to recompute from pos.OpenPrice/pos.Units, which we
+	// already have — see cryptoTakerFeeRate.
+	shares := math.Abs(pos.Units)
+	grossPnl := shares * (currentPrice - pos.OpenPrice)
+	entryFee := takerFee(shares, pos.OpenPrice)
+	exitFee := takerFee(shares, currentPrice)
+	pnl := grossPnl - entryFee - exitFee
 
-	// Refund balance + returns to Web3 wallet (local tracker)
+	// Refund balance + returns to Web3 wallet (local tracker), net of the exit fee.
 	accID := "polymarket_wallet_" + p.accountKey()
 	acc, err := p.store.GetAccount(accID)
 	if err == nil {
-		payoutAmount := math.Abs(pos.Units) * currentPrice
+		payoutAmount := shares*currentPrice - exitFee
 		acc.Balance += payoutAmount
 		acc.UpdatedAt = time.Now()
 		_ = p.store.SaveAccount(acc)
@@ -459,7 +471,7 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 		Timestamp:   time.Now(),
 	})
 
-	p.store.Log("INFO", fmt.Sprintf("[Polymarket] Sold %.2f shares of %s early at $%.2f USDC/share. Realized PnL: $%.2f USDC", math.Abs(pos.Units), pos.Instrument, currentPrice, pnl))
+	p.store.Log("INFO", fmt.Sprintf("[Polymarket] Sold %.2f shares of %s early at $%.2f USDC/share. Realized PnL: $%.2f USDC (gross $%.2f, fees $%.2f)", shares, pos.Instrument, currentPrice, pnl, grossPnl, entryFee+exitFee))
 
 	// Clean up Stop Loss state
 	p.mu.Lock()
@@ -766,6 +778,22 @@ func stringsHasPrefix(s, prefix string) bool {
 // bid. Beyond this the FOK is priced at the floor (usually won't fill) so the position
 // holds and retries rather than dumping into a collapsing/transient-thin book.
 const maxExitSlippage = 0.10
+
+// cryptoTakerFeeRate is Polymarket's documented taker fee rate for the Crypto
+// market category (our BTC Up/Down contracts): fee = shares * rate * price *
+// (1-price), a parabolic curve peaking at price=$0.50. Only takers pay this —
+// makers (resting limit orders) are free — but both our entry (marketable buy)
+// and exit (marketable sell via GetMarketablePrice) are deliberately designed
+// to cross the spread for reliable fills, so we pay it on every leg of every
+// trade. Verified against real trade data: paper PnL without this was +$0.29
+// over our first 13 trades; with real fees applied, -$4.62. Modeling it here
+// (paper and live share this code path) so paper-mode PnL reflects reality
+// instead of silently assuming zero fees.
+const cryptoTakerFeeRate = 0.07
+
+func takerFee(shares, price float64) float64 {
+	return shares * cryptoTakerFeeRate * price * (1 - price)
+}
 
 // reentryCooldown blocks re-entering the same contract for this long after a
 // stop-loss close. A stop-out is often a sign the underlying move is still
