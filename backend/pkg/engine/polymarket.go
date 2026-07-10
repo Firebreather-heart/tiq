@@ -489,6 +489,76 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 	return nil
 }
 
+// ResolvePosition closes a position via contract SETTLEMENT (resolutionPrice is
+// exactly 0.0 or 1.0), not an active CLOB sell. Redemption is free — confirmed
+// against real account activity (a REDEEM entry's usdcSize exactly equalled its
+// share size, no fee deducted) — so unlike ClosePosition this charges the entry
+// fee (already paid at open) but NOT a fabricated exit fee.
+//
+// NOTE: paper-mode only for now. Live settlement redemption is a different
+// on-chain call (CTF redeemPositions) than a CLOB order and isn't implemented
+// here; this path only updates local bookkeeping. It's currently reached by
+// the normal expiration/resolution branch and by any hold-to-redemption (S2)
+// position that survives to settlement.
+func (p *PolymarketEngine) ResolvePosition(id string, resolutionPrice float64) error {
+	p.accountMu.Lock()
+	defer p.accountMu.Unlock()
+
+	pos, err := p.store.GetPosition(id)
+	if err != nil {
+		return err
+	}
+	if pos.Status == "CLOSED" {
+		return nil
+	}
+
+	shares := math.Abs(pos.Units)
+	grossPnl := shares * (resolutionPrice - pos.OpenPrice)
+	entryFee := takerFee(shares, pos.OpenPrice)
+	pnl := grossPnl - entryFee // no exit fee — redemption is free
+
+	accID := "polymarket_wallet_" + p.accountKey()
+	acc, err := p.store.GetAccount(accID)
+	if err == nil {
+		acc.Balance += shares * resolutionPrice // redemption payout, no fee
+		acc.UpdatedAt = time.Now()
+		_ = p.store.SaveAccount(acc)
+	}
+
+	now := time.Now()
+	pos.Status = "CLOSED"
+	pos.ClosePrice = &resolutionPrice
+	pos.CloseTime = &now
+	pos.RealizedPnL = &pnl
+	_ = p.store.SavePosition(pos)
+
+	_ = p.store.SaveTransaction(db.Transaction{
+		ID:          "tx_close_" + pos.ID,
+		Type:        "REDEEM",
+		Instrument:  pos.Instrument,
+		Price:       resolutionPrice,
+		Units:       pos.Units,
+		RealizedPnL: pnl,
+		Timestamp:   time.Now(),
+	})
+
+	p.store.Log("INFO", fmt.Sprintf("[Polymarket] Redeemed %.2f shares of %s at $%.2f/share (settlement). Realized PnL: $%.2f (gross $%.2f, entry fee $%.2f, no exit fee)",
+		shares, pos.Instrument, resolutionPrice, pnl, grossPnl, entryFee))
+
+	p.mu.Lock()
+	delete(p.slStates, id)
+	p.mu.Unlock()
+
+	p.structMu.Lock()
+	if p.structConn != nil {
+		p.structConn.Close()
+		p.structConn = nil
+	}
+	p.structMu.Unlock()
+
+	return nil
+}
+
 func (p *PolymarketEngine) UpdatePrices(prices map[string]float64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -629,7 +699,11 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		// 0. Scalp flatten: never ride a scalp into settlement (binary $0/$1 gap risk).
 		// Force-close 90s before expiry, priced from the live book (same reasoning as
 		// the SL/TP check below: the tape can misstate the position's real value).
-		if expiryUnix-time.Now().Unix() <= 90 {
+		// Skipped for hold-to-redemption positions (instrument tagged "_s2") — those
+		// are DESIGNED to ride into settlement and redeem for free; forcing them out
+		// here would defeat the entire strategy. See ResolvePosition.
+		holdToRedemption := strings.HasSuffix(pos.Instrument, "_s2")
+		if !holdToRedemption && expiryUnix-time.Now().Unix() <= 90 {
 			p.mu.RLock()
 			yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
 			p.mu.RUnlock()
@@ -681,8 +755,41 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 				}
 			}
 
-			_ = p.ClosePosition(pos.ID, resolutionPrice)
+			_ = p.ResolvePosition(pos.ID, resolutionPrice)
 			continue
+		}
+
+		// S2 reversal bail-out: a hold-to-redemption position is only supposed to
+		// ride to settlement while Kraken spot still favors the side we bought. If
+		// spot re-crosses the strike, sell immediately instead of risking a $0
+		// redemption — our own data shows BTC can reverse meaningfully even with
+		// under a minute left (one contract went from 86% one way to 29% the other
+		// within two minutes), so "looked decided at entry" is not a guarantee.
+		if holdToRedemption {
+			if spotPrice, hasSpot := p.GetPrice("BTC_USD"); hasSpot {
+				isLong := pos.Units > 0
+				stillFavored := (isLong && spotPrice >= strike) || (!isLong && spotPrice < strike)
+				if !stillFavored {
+					shares := math.Abs(pos.Units)
+					bailPrice := 0.0
+					if bp, ok, err := p.GetMarketablePrice(isLong, 1, shares); err == nil && ok {
+						bailPrice = bp
+					} else {
+						p.mu.RLock()
+						yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
+						p.mu.RUnlock()
+						if hasPx {
+							bailPrice = yesPx
+							if !isLong {
+								bailPrice = 1.0 - yesPx
+							}
+						}
+					}
+					p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] S2 reversal bail-out: spot $%.2f no longer favors held side (strike $%.2f) for %s. Selling at $%.3f instead of risking a $0 redemption.", spotPrice, strike, pos.ID, bailPrice))
+					_ = p.ClosePosition(pos.ID, bailPrice)
+					continue
+				}
+			}
 		}
 
 		// Fetch the tape price as a last-resort fallback only (see below).

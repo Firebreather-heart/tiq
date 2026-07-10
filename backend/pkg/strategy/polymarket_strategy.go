@@ -59,10 +59,18 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 	// filtering on "cond=<id>", instead of reconstructing it from ambiguous trade-print
 	// logs after the fact (which is why our first attempt at this analysis was
 	// inconclusive — most trades had too few usable, unambiguously-same-contract points).
+	//
+	// Also logs spot/strike/dist (dist = spot-strike; positive favors YES) for the
+	// S2/S3 late-window lag-strategy calibration: the strategy's own "Current Spot"
+	// log line is gated inside the 150-300s entry-window check and NEVER fires below
+	// t_remain=150s (confirmed empirically — zero exceptions across 2000+ log lines),
+	// but S2 operates at t_remain<60s, so there was no historical data to calibrate
+	// against. This line already runs every tick regardless of window, so it's the
+	// natural place to close that gap going forward.
 	if yBid, yAsk, ok1 := pr.polyEngine.GetTopOfBook(true); ok1 {
 		if nBid, nAsk, ok2 := pr.polyEngine.GetTopOfBook(false); ok2 {
-			pr.store.Log("INFO", fmt.Sprintf("[BookSnapshot] cond=%s t_remain=%.0f yes_bid=%.3f yes_ask=%.3f no_bid=%.3f no_ask=%.3f",
-				currentCondID, timeRemaining, yBid, yAsk, nBid, nAsk))
+			pr.store.Log("INFO", fmt.Sprintf("[BookSnapshot] cond=%s t_remain=%.0f yes_bid=%.3f yes_ask=%.3f no_bid=%.3f no_ask=%.3f spot=%.2f strike=%.2f dist=%.2f",
+				currentCondID, timeRemaining, yBid, yAsk, nBid, nAsk, currentPrice, pr.cfg.StrikePrice, currentPrice-pr.cfg.StrikePrice))
 		}
 	}
 
@@ -91,6 +99,13 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 			}
 			return nil
 		}
+	}
+
+	// S2: late-window decisive-lag strategy. Operates in the closing seconds, well
+	// outside (and mutually exclusive with) the normal 150-300s entry window below —
+	// no existing position was found on this contract above, so it's safe to check.
+	if timeRemaining <= s2MaxTimeRemaining {
+		return pr.tryS2Entry(currentPrice, atr, timeRemaining, marketYesPrice, marketNoPrice)
 	}
 
 	// Entry window: from contract open (~300s) down to 150s remaining. This leaves >=60s of
@@ -289,4 +304,101 @@ func checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, minEdge float64) (pro
 		return false, edge, fmt.Sprintf("price $%.2f outside $0.35–$0.65 boundary", buyPrice)
 	}
 	return true, edge, ""
+}
+
+// S2: late-window "decisive Kraken lag" strategy. Distinct from the main
+// entry logic above — it doesn't bet on a model-vs-market EDGE, it waits until
+// spot is decisively past the strike in the closing seconds and buys the side
+// Kraken already favors, holding to free settlement redemption instead of a
+// normal SL/TP exit (see ResolvePosition and the reversal bail-out in
+// EvaluatePositionTriggers).
+//
+// These thresholds are an explicit, UNCALIBRATED starting hypothesis, not a
+// fitted number — we confirmed there is zero historical spot-price data below
+// t_remain=150s to calibrate against (the existing "Current Spot" log line
+// is gated inside the normal entry-window check and never fires below it).
+// The extended BookSnapshot logging (spot/strike/dist, every tick, any
+// t_remain) exists specifically to accumulate the data needed to calibrate
+// these numbers properly later.
+const (
+	s2MaxTimeRemaining = 60.0 // only operate in the closing seconds
+	s2MinProb          = 0.90 // Black-Scholes-style model confidence floor
+	// Sanity floor independent of the volatility-scaled probability above.
+	// Guards against the exact overconfidence failure minVolPerSec exists to
+	// prevent elsewhere: near-zero measured volatility can make the model
+	// read 99% confident on a real gap that's actually quite small.
+	s2MinAbsDistance = 50.0
+	// Leaves margin over the ~$0.925 fee-adjusted breakeven (taker fee at
+	// $0.93 is cheap, but buying at $0.99 leaves ~nothing to gain).
+	s2MaxEntryPrice = 0.93
+	// Fixed risk size, matching the main strategy's per-trade sizing.
+	s2RiskCapital = 5.00
+)
+
+// checkS2Gates applies S2's pure entry conditions (no I/O), mirroring
+// checkEntryGates' separation so the thresholds are unit-testable independent
+// of book/network calls.
+func checkS2Gates(dist, prob, buyPrice float64) (proceed bool, reason string) {
+	if math.Abs(dist) < s2MinAbsDistance {
+		return false, fmt.Sprintf("spot-strike distance $%.0f below $%.0f floor — too close to trust this late", dist, s2MinAbsDistance)
+	}
+	if prob < s2MinProb {
+		return false, fmt.Sprintf("model confidence %.1f%% below %.0f%% floor", prob*100, s2MinProb*100)
+	}
+	if buyPrice > s2MaxEntryPrice {
+		return false, fmt.Sprintf("book already at $%.2f — no margin left over $%.2f max", buyPrice, s2MaxEntryPrice)
+	}
+	return true, ""
+}
+
+// tryS2Entry checks S2's trigger and, if it fires, opens a single-sided,
+// hold-to-redemption position (instrument tagged "_s2"). Only reached when no
+// position already exists on this contract (checked by the caller) and
+// timeRemaining <= s2MaxTimeRemaining.
+func (pr *PolymarketRunner) tryS2Entry(currentPrice, atr, timeRemaining, marketYesPrice, marketNoPrice float64) error {
+	volatilityPerSec := (atr / currentPrice) / math.Sqrt(300.0)
+	if volatilityPerSec < minVolPerSec {
+		volatilityPerSec = minVolPerSec
+	}
+	d := math.Log(currentPrice/pr.cfg.StrikePrice) / (volatilityPerSec * math.Sqrt(timeRemaining))
+	trueYesProbability := 0.5 * (1.0 + math.Erf(d/math.Sqrt(2.0)))
+	trueNoProbability := 1.0 - trueYesProbability
+
+	dist := currentPrice - pr.cfg.StrikePrice
+	isYes := dist > 0
+	side, prob, feedPrice := "NO", trueNoProbability, marketNoPrice
+	if isYes {
+		side, prob, feedPrice = "YES", trueYesProbability, marketYesPrice
+	}
+
+	if feedPrice <= 0 {
+		return nil
+	}
+	estUnits := s2RiskCapital / feedPrice
+	bestBid, bestAsk, buyPrice, ok, err := pr.polyEngine.EvaluateEntryBook(isYes, estUnits)
+	if err != nil || !ok {
+		return nil // book one-sided/thin/unavailable — silent, this is the common case far from the trigger
+	}
+
+	proceed, reason := checkS2Gates(dist, prob, buyPrice)
+	if !proceed {
+		// Only log the "decisive but priced out" case — useful for tuning
+		// s2MaxEntryPrice. The distance/probability misses are the overwhelming
+		// majority of ticks and would just be noise.
+		if math.Abs(dist) >= s2MinAbsDistance && prob >= s2MinProb {
+			pr.store.Log("INFO", fmt.Sprintf("[S2] %s decisive (prob %.1f%%, dist $%.0f, t_remain=%.0fs) but %s", side, prob*100, dist, timeRemaining, reason))
+		}
+		return nil
+	}
+
+	units := s2RiskCapital / buyPrice
+	if !isYes {
+		units = -units
+	}
+	pr.store.Log("INFO", fmt.Sprintf("[S2] Decisive late-window entry! Buying %.2f %s @ $%.2f (bid $%.2f/ask $%.2f, model prob %.1f%%, spot-strike dist $%.0f, t_remain=%.0fs). Holding to redemption.",
+		math.Abs(units), side, buyPrice, bestBid, bestAsk, prob*100, dist, timeRemaining))
+
+	marketAddr := pr.cfg.MarketAddress + "_s2"
+	_, err = pr.polyEngine.OpenPosition(marketAddr, units, buyPrice, 0, 0)
+	return err
 }
