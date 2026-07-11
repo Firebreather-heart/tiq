@@ -17,20 +17,20 @@ import (
 )
 
 type Config struct {
-	Instrument       string  `json:"instrument"`         // e.g., "EUR_USD"
-	AlloraTopicID    int     `json:"allora_topic_id"`     // e.g., 1 (BTC) or forex topic
-	Granularity      string  `json:"granularity"`         // e.g., "M5", "M15"
-	RiskPercent      float64 `json:"risk_percent"`        // e.g., 1.0 (1% of balance)
-	AtrMultiplier    float64 `json:"atr_multiplier"`      // e.g., 2.0 (for Stop Loss)
-	TpMultiplier     float64 `json:"tp_multiplier"`       // e.g., 3.0 (for Take Profit)
-	EmaFastPeriod    int     `json:"ema_fast_period"`     // e.g., 10
-	EmaSlowPeriod    int     `json:"ema_slow_period"`     // e.g., 25
-	RsiPeriod        int     `json:"rsi_period"`          // e.g., 14
-	MinRsiFilter     float64 `json:"min_rsi_filter"`      // e.g., 30 (oversold, buy threshold)
-	MaxRsiFilter     float64 `json:"max_rsi_filter"`      // e.g., 70 (overbought, sell threshold)
-	TradingEnabled   bool    `json:"trading_enabled"`     // Toggles strategy execution
-	UseAllora        bool    `json:"use_allora"`          // Toggles using AI inferences
-	DefaultPipValue  float64 `json:"default_pip_value"`   // e.g., 0.0001 for EUR/USD
+	Instrument      string  `json:"instrument"`        // e.g., "EUR_USD"
+	AlloraTopicID   int     `json:"allora_topic_id"`   // e.g., 1 (BTC) or forex topic
+	Granularity     string  `json:"granularity"`       // e.g., "M5", "M15"
+	RiskPercent     float64 `json:"risk_percent"`      // e.g., 1.0 (1% of balance)
+	AtrMultiplier   float64 `json:"atr_multiplier"`    // e.g., 2.0 (for Stop Loss)
+	TpMultiplier    float64 `json:"tp_multiplier"`     // e.g., 3.0 (for Take Profit)
+	EmaFastPeriod   int     `json:"ema_fast_period"`   // e.g., 10
+	EmaSlowPeriod   int     `json:"ema_slow_period"`   // e.g., 25
+	RsiPeriod       int     `json:"rsi_period"`        // e.g., 14
+	MinRsiFilter    float64 `json:"min_rsi_filter"`    // e.g., 30 (oversold, buy threshold)
+	MaxRsiFilter    float64 `json:"max_rsi_filter"`    // e.g., 70 (overbought, sell threshold)
+	TradingEnabled  bool    `json:"trading_enabled"`   // Toggles strategy execution
+	UseAllora       bool    `json:"use_allora"`        // Toggles using AI inferences
+	DefaultPipValue float64 `json:"default_pip_value"` // e.g., 0.0001 for EUR/USD
 }
 
 type Runner struct {
@@ -45,6 +45,10 @@ type Runner struct {
 	lastCandleFetch time.Time
 	polyMu          sync.RWMutex
 	latestPolyInfo  *PolymarketMarketInfo
+	// strikeCache pins one strike per contract window (key = StartTimestamp) so
+	// every tick of a window trades against the same number. See resolveStrike.
+	strikeCache   map[int64]float64
+	strikeCacheMu sync.Mutex
 }
 
 func NewRunner(cfg Config, store *db.DB, oClient *oanda.Client, aClient interface{}, eng engine.ExecutionEngine) *Runner {
@@ -54,6 +58,7 @@ func NewRunner(cfg Config, store *db.DB, oClient *oanda.Client, aClient interfac
 		oandaClient:  oClient,
 		alloraClient: aClient,
 		engine:       eng,
+		strikeCache:  make(map[int64]float64),
 	}
 }
 
@@ -99,7 +104,7 @@ func (r *Runner) Tick() error {
 			if len(candles) < r.cfg.EmaSlowPeriod+2 {
 				return fmt.Errorf("insufficient candles fetched: got %d", len(candles))
 			}
-			
+
 			r.cachedCandles = candles
 			closes := make([]float64, len(candles))
 			highs := make([]float64, len(candles))
@@ -109,11 +114,11 @@ func (r *Runner) Tick() error {
 				highs[i] = c.High
 				lows[i] = c.Low
 			}
-			
+
 			atr := calculateATR(highs, lows, closes, 5)
 			r.cachedATR = atr[len(atr)-1]
 			r.lastCandleFetch = time.Now()
-			
+
 			latestCandle := candles[len(candles)-1]
 			currentPrice = latestCandle.Close
 			latestATR = r.cachedATR
@@ -136,17 +141,17 @@ func (r *Runner) Tick() error {
 		fastEMA := calculateEMA(closes, r.cfg.EmaFastPeriod)
 		slowEMA := calculateEMA(closes, r.cfg.EmaSlowPeriod)
 		isBullishTrend := fastEMA[len(fastEMA)-1] > slowEMA[len(slowEMA)-1]
-		
+
 		prices := map[string]float64{
 			r.cfg.Instrument: currentPrice,
 		}
 		_ = polyEng.UpdatePrices(prices)
 		latestATR = r.cachedATR
-		
+
 		// Fetch exact live Polymarket strike and expiration from real contracts
 		r.store.Log("INFO", "[Polymarket] Querying active BTC contracts directly from Polymarket Gamma API...")
 		liveMarket, err := FetchActivePolymarketStrike(currentPrice)
-		
+
 		var strike float64
 		var expiration time.Time
 		var marketAddr string
@@ -163,6 +168,11 @@ func (r *Runner) Tick() error {
 						if sVal, err := strconv.ParseFloat(posParts[3], 64); err == nil {
 							strike = sVal
 							foundActivePos = true
+							// Seed the per-window cache too, so a re-entry after this
+							// position closes uses the same strike (consistency).
+							r.strikeCacheMu.Lock()
+							r.strikeCache[liveMarket.StartTimestamp] = sVal
+							r.strikeCacheMu.Unlock()
 							r.store.Log("INFO", fmt.Sprintf("[Polymarket] Active position found. Matching strike price to open position: $%.2f", strike))
 							break
 						}
@@ -171,20 +181,17 @@ func (r *Runner) Tick() error {
 			}
 
 			if !foundActivePos {
-				// Find the candle corresponding to the start timestamp of the active 5-minute window
-				// to extract the exact Open price at the beginning of the interval
-				foundCandle := false
-				for _, c := range candles {
-					if c.Time.Unix() == liveMarket.StartTimestamp {
-						strike = c.Open
-						foundCandle = true
-						break
-					}
+				s, ok := r.resolveStrike(liveMarket, candles, currentPrice)
+				if !ok {
+					// No reliable strike for this window yet (candle not published,
+					// too late in the window for the spot proxy). Every entry gate
+					// depends on spot-vs-strike distance, so trading against a wrong
+					// number is worse than not trading: skip this tick and retry —
+					// the exact candle usually appears within seconds.
+					r.store.Log("WARN", fmt.Sprintf("[Polymarket] No reliable strike for window %d yet — skipping tick rather than trading against a stale one.", liveMarket.StartTimestamp))
+					return nil
 				}
-				if !foundCandle && len(candles) > 0 {
-					// Fallback to the open price of the last candle if we don't have the exact timestamp candle
-					strike = candles[len(candles)-1].Open
-				}
+				strike = s
 			}
 
 			expiration = liveMarket.Expiration
@@ -193,9 +200,9 @@ func (r *Runner) Tick() error {
 				hexAddr = "0x_dummy_clob_token"
 			}
 			marketAddr = fmt.Sprintf("poly_%s_strike_%.0f_expiry_%d", hexAddr, strike, expiration.Unix())
-			r.store.Log("INFO", fmt.Sprintf("[Polymarket] Direct API Match! Strike: $%.2f, Expiry: %s. Question: %q | StartTS: %d | YesPrice: %.3f, NoPrice: %.3f", 
+			r.store.Log("INFO", fmt.Sprintf("[Polymarket] Direct API Match! Strike: $%.2f, Expiry: %s. Question: %q | StartTS: %d | YesPrice: %.3f, NoPrice: %.3f",
 				strike, expiration.Format("15:04:05"), liveMarket.Question, liveMarket.StartTimestamp, liveMarket.YesPrice, liveMarket.NoPrice))
-			
+
 			// Subscribe the Polymarket engine to the active YES/NO contract CLOB tokens in real-time
 			if polyEng, ok := r.engine.(*engine.PolymarketEngine); ok {
 				polyEng.SubscribeToMarketTokens(liveMarket.YesTokenID, liveMarket.NoTokenID, marketAddr, liveMarket.NegRisk)
@@ -222,7 +229,7 @@ func (r *Runner) Tick() error {
 			MinExpectedValue: 0.12,
 			RiskPercent:      r.cfg.RiskPercent,
 		}
-		
+
 		polyRunner := NewPolymarketRunner(polyCfg, r.store, polyEng)
 
 		// H: prefer the fresh WS-fed token price over the (polled, seconds-old) Gamma quote
@@ -289,14 +296,13 @@ func (r *Runner) Tick() error {
 	var alloraSignal float64 = 0.0 // positive = bullish, negative = bearish
 	alloraActive := false
 
-
 	// 5. Generate Trading Signal
 	var signal string = "HOLD"
-	
+
 	if strings.Contains(strings.ToUpper(r.cfg.Instrument), "BTC") {
 		r.store.Log("INFO", "[Polymarket-Oanda] Querying active BTC contracts directly from Polymarket Gamma API...")
 		liveMarket, err := FetchActivePolymarketStrike(currentPrice)
-		
+
 		var strike float64
 		var timeRemaining float64
 		if err == nil && liveMarket != nil {
@@ -305,22 +311,22 @@ func (r *Runner) Tick() error {
 			if timeRemaining <= 0 {
 				timeRemaining = 180.0
 			}
-			r.store.Log("INFO", fmt.Sprintf("[Polymarket-Oanda] Direct API Match! Strike: $%.2f, Expiry: %s. Question: %q", 
+			r.store.Log("INFO", fmt.Sprintf("[Polymarket-Oanda] Direct API Match! Strike: $%.2f, Expiry: %s. Question: %q",
 				strike, liveMarket.Expiration.Format("15:04:05"), liveMarket.Question))
 		} else {
 			r.store.Log("ERROR", fmt.Sprintf("[Polymarket-Oanda API Failure] Could not fetch live contract: %v. Local estimation is disabled.", err))
 			return fmt.Errorf("polymarket API integration failed for Oanda driver: %w", err)
 		}
-		
+
 		volatilityPerSec := (latestATR / currentPrice) / math.Sqrt(300.0)
 		if volatilityPerSec <= 0 {
 			volatilityPerSec = 0.0001
 		}
-		
+
 		d := math.Log(currentPrice/strike) / (volatilityPerSec * math.Sqrt(timeRemaining))
 		trueYesProbability := 0.5 * (1.0 + math.Erf(d/math.Sqrt(2.0)))
 		trueNoProbability := 1.0 - trueYesProbability
-		
+
 		marketYesPrice := 0.50 + (math.Sin(float64(time.Now().Unix())*0.01) * 0.15)
 		if marketYesPrice < 0.05 {
 			marketYesPrice = 0.05
@@ -328,13 +334,13 @@ func (r *Runner) Tick() error {
 			marketYesPrice = 0.95
 		}
 		marketNoPrice := 1.0 - marketYesPrice
-		
+
 		yesEV := (trueYesProbability * 1.0) - marketYesPrice
 		noEV := (trueNoProbability * 1.0) - marketNoPrice
-		
+
 		r.store.Log("INFO", fmt.Sprintf("[Polymarket-Oanda] Odds: YES=$%.2f, NO=$%.2f. Prob: YES=%.1f%%, NO=%.1f%%. EV: YES=+$%.2f, NO=+$%.2f",
 			marketYesPrice, marketNoPrice, trueYesProbability*100, trueNoProbability*100, yesEV, noEV))
-			
+
 		if yesEV >= 0.02 {
 			signal = "BUY"
 			r.store.Log("INFO", "[Polymarket-Oanda] Dynamic Bullish EV Edge! Output: Oanda BUY Signal")
@@ -351,8 +357,8 @@ func (r *Runner) Tick() error {
 		isBullishTrend := latestFastEMA > latestSlowEMA
 		isBearishTrend := latestFastEMA < latestSlowEMA
 
-		alloraBullishHighProb := alloraActive && (alloraSignal > currentPrice * 1.0005)
-		alloraBearishHighProb := alloraActive && (alloraSignal < currentPrice * 0.9995)
+		alloraBullishHighProb := alloraActive && (alloraSignal > currentPrice*1.0005)
+		alloraBearishHighProb := alloraActive && (alloraSignal < currentPrice*0.9995)
 
 		if isBullishTrend && latestRSI < r.cfg.MaxRsiFilter {
 			if alloraActive {
@@ -492,6 +498,81 @@ func (r *Runner) Tick() error {
 	}
 
 	return nil
+}
+
+// resolveStrike determines the strike (BTC price at the contract window's open)
+// for a btc-updown market, caching one value per window so every tick trades
+// against the same number.
+//
+// Context: these markets settle on Chainlink's BTC/USD stream ("not according
+// to other sources or spot markets" — per the market description), and the
+// Gamma API publishes NO strike field; the strike simply IS the price at window
+// start. We approximate it with Kraken's same-window candle open (tracks
+// Chainlink within a few dollars — fine for a $30+ distance signal).
+//
+// This replaces a bug where, when the exact-window candle wasn't in our (up to
+// 30s stale) cache at window start, we silently fell back to the PREVIOUS
+// candle's open. Validated against real Kraken history: 46 of 47 recorded
+// trades had traded against the prior window's open, ~$60 off — larger than
+// the $30 minimum lag the entry gate requires, i.e. every gate decision ran on
+// a wrong number. The fallback ladder is now:
+//
+//  1. cached strike for this window (stability across ticks)
+//  2. exact-window candle open from the already-fetched candles
+//  3. force-refresh candles once and retry the exact match (the usual fix —
+//     the forming candle appears on Kraken within seconds of window start)
+//  4. live spot, only within the first 30s of the window (close enough to the
+//     open to be a fair proxy)
+//  5. give up (caller skips the tick) — NEVER the previous candle's open
+func (r *Runner) resolveStrike(liveMarket *PolymarketMarketInfo, candles []oanda.Candle, currentPrice float64) (float64, bool) {
+	startTS := liveMarket.StartTimestamp
+
+	r.strikeCacheMu.Lock()
+	if s, ok := r.strikeCache[startTS]; ok {
+		r.strikeCacheMu.Unlock()
+		return s, true
+	}
+	// Bound the cache: windows roll every 5 minutes, entries older than an hour
+	// can never be asked for again.
+	for ts := range r.strikeCache {
+		if ts < startTS-3600 {
+			delete(r.strikeCache, ts)
+		}
+	}
+	r.strikeCacheMu.Unlock()
+
+	cache := func(s float64) (float64, bool) {
+		r.strikeCacheMu.Lock()
+		r.strikeCache[startTS] = s
+		r.strikeCacheMu.Unlock()
+		return s, true
+	}
+
+	// 2. exact-window candle in the current set
+	for _, c := range candles {
+		if c.Time.Unix() == startTS {
+			return cache(c.Open)
+		}
+	}
+
+	// 3. the candle cache can be up to 30s stale at window start — refresh once
+	if fresh, err := r.GetCandles(r.GetConfig().Instrument, 100); err == nil {
+		r.cachedCandles = fresh
+		r.lastCandleFetch = time.Now()
+		for _, c := range fresh {
+			if c.Time.Unix() == startTS {
+				return cache(c.Open)
+			}
+		}
+	}
+
+	// 4. early enough in the window that live spot ≈ the open
+	if elapsed := time.Now().Unix() - startTS; elapsed >= 0 && elapsed <= 30 && currentPrice > 0 {
+		r.store.Log("INFO", fmt.Sprintf("[Polymarket] Using live spot $%.2f as strike proxy for window %d (%ds after open; exact candle not yet published).", currentPrice, startTS, elapsed))
+		return cache(currentPrice)
+	}
+
+	return 0, false
 }
 
 // Indicator helper functions (Standard Go implementation)
@@ -644,8 +725,6 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 
 	return candles, nil
 }
-
-
 
 // fetchBinanceCandles retrieves 24/7 spot crypto market candles from Binance's public REST API
 func fetchBinanceCandles(symbol string, count int) ([]oanda.Candle, error) {
@@ -904,7 +983,7 @@ func (r *Runner) LiveTick() error {
 	}
 	instUpper := strings.ToUpper(cfg.Instrument)
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
-	
+
 	if isCrypto {
 		livePrice, err := fetchLivePrice(cfg.Instrument)
 		if err == nil && livePrice > 0 {
@@ -1019,5 +1098,3 @@ func fetchLivePrice(symbol string) (float64, error) {
 	}
 	return 0, fmt.Errorf("no live price found")
 }
-
-
