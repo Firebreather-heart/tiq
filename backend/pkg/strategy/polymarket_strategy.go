@@ -529,6 +529,16 @@ const (
 	// this is really "one shot per contract," the duration just needs to clear
 	// the window.
 	s4RetryCooldown = 35 * time.Second
+
+	// GATE (sweep depth): reject if filling all 5 shares requires dipping more
+	// than 3c below the best ask. A wide gap between the top-of-book quote and
+	// the price actually needed to fill our size is a direct signal the book is
+	// thin/unstable RIGHT NOW — a case the min-price floor alone wouldn't
+	// reliably catch (a book quoting $0.97 at the top can still swept-price at
+	// $0.86 for 5 shares on thin depth, clearing s4MinEntryPrice while being a
+	// genuinely bad book to trade into). Observed live top-of-book spreads were
+	// consistently ~$0.01; 3c is well outside normal spread noise.
+	s4MaxSweepDepth = 0.03
 )
 
 var (
@@ -553,10 +563,25 @@ func checkS4Price(buyPrice float64) (proceed bool, reason string) {
 	return true, ""
 }
 
+// checkS4SweepDepth is the pure sweep-depth gate (see tryS4Entry): how far the
+// price needed to fill the full size sits above the best ask (a BUY sweep
+// only ever gets more expensive with depth, never cheaper).
+func checkS4SweepDepth(bestAsk, buyPrice float64) (proceed bool, reason string) {
+	depth := buyPrice - bestAsk
+	// Epsilon guards the boundary against float noise: real inputs are always
+	// cent-rounded (EvaluateEntryBook ceils to the $0.01 tick), and comparing
+	// two such values can land a hair on either side of an exact-looking cap.
+	if depth > s4MaxSweepDepth+1e-9 {
+		return false, fmt.Sprintf("book too thin: filling %.0f shares needs $%.2f (best ask $%.2f, depth $%.2f > $%.2f cap)", s4FixedShares, buyPrice, bestAsk, depth, s4MaxSweepDepth)
+	}
+	return true, ""
+}
+
 // tryS4Entry buys whichever side is currently priced higher, gated by
-// checkS4SpotAgreement and checkS4Price above plus a per-contract re-entry
-// guard. Only reached when no S4 position already exists on this contract
-// (checked by the caller) and timeRemaining <= s4MaxTimeRemaining.
+// checkS4SpotAgreement, checkS4SweepDepth and checkS4Price above plus a
+// per-contract re-entry guard. Only reached when no S4 position already
+// exists on this contract (checked by the caller) and
+// timeRemaining <= s4MaxTimeRemaining.
 //
 // Side selection reads the LIVE BOOK (GetTopOfBook), never the last-trade
 // tape — a stale tape print can disagree sharply with where the book
@@ -608,6 +633,13 @@ func (pr *PolymarketRunner) tryS4Entry(currentPrice, timeRemaining float64) erro
 	bestBid, bestAsk, buyPrice, ok, err := pr.polyEngine.EvaluateEntryBook(isYes, s4FixedShares)
 	if err != nil || !ok {
 		return nil // book one-sided/thin/unavailable — silent, same as S2/S3
+	}
+
+	// GATE (sweep depth): the book must have real depth at the top, not just a
+	// tempting quote that thins out immediately below it.
+	if proceed, reason := checkS4SweepDepth(bestAsk, buyPrice); !proceed {
+		pr.store.Log("INFO", fmt.Sprintf("[S4] %s: %s. t_remain=%.0fs.", side, reason, timeRemaining))
+		return nil
 	}
 
 	// GATE (min price): the book must show real conviction, not a coin flip.
