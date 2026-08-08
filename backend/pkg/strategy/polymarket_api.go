@@ -27,13 +27,13 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 	// Mathematically calculate the current and next 5-minute btc-updown market slugs
 	now := time.Now().Unix()
 	windowTS := (now / 300) * 300
-	
+
 	// Check the current active window first
 	slug := fmt.Sprintf("btc-updown-5m-%d", windowTS)
-	
+
 	client := &http.Client{Timeout: 5 * time.Second}
 	url := fmt.Sprintf("https://gamma-api.polymarket.com/markets/slug/%s", slug)
-	
+
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -60,7 +60,7 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 			if parseErr != nil {
 				expTime, parseErr = time.Parse("2006-01-02T15:04:05Z", m.EndDate)
 			}
-			
+
 			// If it has more than 10 seconds remaining, trade this active window!
 			if parseErr == nil && time.Until(expTime).Seconds() > 10.0 {
 				var startTS int64
@@ -106,7 +106,7 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 	// If current is too close to expiry or not found, query the NEXT upcoming window!
 	nextSlug := fmt.Sprintf("btc-updown-5m-%d", windowTS+300)
 	nextURL := fmt.Sprintf("https://gamma-api.polymarket.com/markets/slug/%s", nextSlug)
-	
+
 	nextResp, err := client.Get(nextURL)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 			if parseErr != nil {
 				expTime, parseErr = time.Parse("2006-01-02T15:04:05Z", m.EndDate)
 			}
-			
+
 			if parseErr == nil {
 				var startTS int64
 				parts := strings.Split(m.Slug, "-")
@@ -169,10 +169,10 @@ func FetchActivePolymarketStrike(currentPrice float64) (*PolymarketMarketInfo, e
 func FetchPolymarketPricesByExpiry(expiryUnix int64) (float64, float64, error) {
 	startTS := expiryUnix - 300
 	slug := fmt.Sprintf("btc-updown-5m-%d", startTS)
-	
+
 	client := &http.Client{Timeout: 3 * time.Second}
 	url := fmt.Sprintf("https://gamma-api.polymarket.com/markets/slug/%s", slug)
-	
+
 	resp, err := client.Get(url)
 	if err != nil {
 		return 0, 0, err
@@ -206,4 +206,3 @@ func FetchPolymarketPricesByExpiry(expiryUnix int64) (float64, float64, error) {
 
 	return 0, 0, fmt.Errorf("failed to parse outcome prices")
 }
-

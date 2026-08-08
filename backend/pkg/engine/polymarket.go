@@ -96,6 +96,43 @@ type PolymarketEngine struct {
 	keyMgr              *structKeyManager
 	bookCache           map[string]cachedBook // tokenID -> short-lived order-book snapshot (see fetchBook)
 	bookCacheMu         sync.Mutex
+	shadowRedemptions   map[string]*shadowEntry // posID -> pending TP/SL-vs-redemption comparison, see recordShadowFromClosed/checkShadowRedemptions
+	shadowMu            sync.Mutex
+	redeemAttempts      map[string]time.Time // posID -> last live-redemption attempt (dedupe/backoff, see startLiveRedemption)
+	redeemMu            sync.Mutex
+	nearMisses          map[string]*nearMissEntry // conditionID -> a sub-threshold setup we rejected, tracked to settlement (see RecordNearMiss)
+	nearMissMu          sync.Mutex
+}
+
+// nearMissEntry records an entry the strategy REJECTED only because its edge
+// fell in [0.06, 0.12) — i.e. it passed every other gate (price in band, book
+// tight, probability not saturated) but missed the $0.12 edge floor. We never
+// take the trade; we just track it to settlement so we can answer "is the 0.12
+// floor too strict?" from real outcomes instead of a fragile after-the-fact
+// log join. Pure analysis: no capital, no position, no balance effect.
+type nearMissEntry struct {
+	side       string // "YES" or "NO" — the side we would have bought
+	edge       float64
+	buyPrice   float64
+	strike     float64
+	expiryUnix int64
+	recordedAt time.Time
+}
+
+// shadowEntry captures an early-exited (TP/SL/scalp-flatten) trade so that,
+// once its contract's true expiry passes, we can log what holding to
+// redemption instead would have paid — for direct comparison. Analysis only:
+// never mutates balance or position state, since the real exit already
+// happened.
+type shadowEntry struct {
+	instrument  string
+	units       float64
+	openPrice   float64
+	strike      float64
+	expiryUnix  int64
+	actualClose float64
+	actualPnl   float64
+	closeReason string
 }
 
 func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*PolymarketEngine, error) {
@@ -163,6 +200,9 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 		slStates:          make(map[string]time.Time),
 		lastStopCloseTime: make(map[string]time.Time),
 		bookCache:         make(map[string]cachedBook),
+		shadowRedemptions: make(map[string]*shadowEntry),
+		redeemAttempts:    make(map[string]time.Time),
+		nearMisses:        make(map[string]*nearMissEntry),
 		rpcURL:            rpcURL,
 		clobURL:           "https://clob.polymarket.com",
 		keyMgr:            km,
@@ -193,6 +233,8 @@ func NewPolymarketEngine(store *db.DB, pkHex string, rpcURL string) (*Polymarket
 
 		for range ticker.C {
 			_ = engine.EvaluatePositionTriggers()
+			engine.checkShadowRedemptions()
+			engine.checkNearMisses()
 		}
 	}()
 
@@ -228,6 +270,12 @@ func (p *PolymarketEngine) GetBalance() (float64, float64, error) {
 	}
 
 	return acc.Balance, equity, nil
+}
+
+// GetPosition returns a single position by ID (passthrough to the store). Used
+// by S3's post-fill hedge sanity check.
+func (p *PolymarketEngine) GetPosition(id string) (db.Position, error) {
+	return p.store.GetPosition(id)
 }
 
 func (p *PolymarketEngine) GetOpenPositions() ([]db.Position, error) {
@@ -296,6 +344,7 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 		// actual filled quantity (keeping the YES/NO sign) and deduct the real
 		// USDC spend — otherwise the later sell would try to move shares we
 		// never owned and the balance tracker would drift from the wallet.
+		limitPrice := currentPrice
 		orderID, filledShares, actualCost, err := p.submitLiveBuyOrder(tokenID, currentPrice, cost)
 		if err != nil {
 			return "", fmt.Errorf("[CLOB] Buy order failed: %w", err)
@@ -306,8 +355,18 @@ func (p *PolymarketEngine) OpenPosition(market string, units float64, currentPri
 			units = filledShares
 		}
 		cost = actualCost
-		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE buy order filled. OrderID: %s | Token: %s | Price: $%.2f | Shares: %.0f | USDC: $%.2f",
-			orderID, tokenID[:8]+"...", currentPrice, filledShares, actualCost))
+		// Price the position at the REAL average fill, not the limit we asked
+		// for — a marketable FOK can fill better than its limit (see
+		// submitLiveBuyOrder). This becomes pos.OpenPrice below: the cost basis
+		// every downstream PnL calc (ClosePosition, ResolvePosition) is computed
+		// against. Leaving it at the stale limit would silently mis-price every
+		// fill that got price improvement — the buy-side twin of the sell-side
+		// bug already fixed in submitLiveSellOrder/ClosePosition.
+		if filledShares > 0 {
+			currentPrice = actualCost / filledShares
+		}
+		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE buy order filled. OrderID: %s | Token: %s | Price: $%.4f (limit was $%.2f) | Shares: %.0f | USDC: $%.2f",
+			orderID, tokenID[:8]+"...", currentPrice, limitPrice, filledShares, actualCost))
 	} else {
 		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] Signed EIP-712 buy order for %s outcome. Wallet: %s", market, p.walletAddress))
 	}
@@ -420,16 +479,21 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 			p.store.Log("WARN", fmt.Sprintf("[CLOB] Exit %s: live bid unavailable (fillable=%t, err=%v) — using trigger price $%.2f.", id, fillable, mErr, currentPrice))
 		}
 
-		_, sellErr := p.submitLiveSellOrder(tokenID, sellPrice, shares)
+		_, proceeds, sellErr := p.submitLiveSellOrder(tokenID, sellPrice, shares)
 		if sellErr != nil {
 			// CRITICAL: do NOT close locally — that would inflate the balance with USDC we never received.
 			p.store.Log("ERROR", fmt.Sprintf("[CLOB] SELL order for %s FAILED: %v — position kept OPEN to prevent balance inflation.", id, sellErr))
 			return fmt.Errorf("CLOB sell failed: %w", sellErr)
 		}
-		// The marketable bid is the effective fill price — record PnL against it.
-		currentPrice = sellPrice
-		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE sell filled. Token: %s | Price: $%.2f | Shares: %.2f",
-			tokenID[:8]+"...", currentPrice, shares))
+		// Price the exit off the ACTUAL proceeds, not the pre-trade estimate — a
+		// marketable FOK can fill better than its limit (see submitLiveSellOrder).
+		// Dividing the real proceeds by the same `shares` used in the PnL math
+		// below keeps the two internally consistent regardless of any float
+		// jitter between this estimate and the whole-share amount actually sold.
+		estPrice := sellPrice
+		currentPrice = proceeds / shares
+		p.store.Log("INFO", fmt.Sprintf("[Web3 CLOB] LIVE sell filled. Token: %s | Price: $%.4f (est was $%.2f) | Shares: %.2f | Proceeds: $%.2f",
+			tokenID[:8]+"...", currentPrice, estPrice, shares, proceeds))
 	}
 
 	// Realized P&L against the actual close price (marketable fill in live mode),
@@ -495,11 +559,10 @@ func (p *PolymarketEngine) ClosePosition(id string, currentPrice float64) error 
 // share size, no fee deducted) — so unlike ClosePosition this charges the entry
 // fee (already paid at open) but NOT a fabricated exit fee.
 //
-// NOTE: paper-mode only for now. Live settlement redemption is a different
-// on-chain call (CTF redeemPositions) than a CLOB order and isn't implemented
-// here; this path only updates local bookkeeping. It's currently reached by
-// the normal expiration/resolution branch and by any hold-to-redemption (S2)
-// position that survives to settlement.
+// This function only updates local bookkeeping. In paper mode the expiry
+// branch calls it directly; in live mode LiveRedeemPosition (polymarket_redeem.go)
+// calls it only AFTER the on-chain CTF redemption is confirmed (winners) or the
+// on-chain resolution shows we lost (no tx needed, tokens are worthless).
 func (p *PolymarketEngine) ResolvePosition(id string, resolutionPrice float64) error {
 	p.accountMu.Lock()
 	defer p.accountMu.Unlock()
@@ -559,6 +622,159 @@ func (p *PolymarketEngine) ResolvePosition(id string, resolutionPrice float64) e
 	return nil
 }
 
+// recordShadowFromClosed re-reads a just-closed position from the store (to get
+// the authoritative fill price/PnL, including any live-mode slippage
+// adjustment ClosePosition applied) and files it for the TP/SL-vs-redemption
+// comparison logged once its contract truly expires. See checkShadowRedemptions.
+func (p *PolymarketEngine) recordShadowFromClosed(posID, instrument string, units, openPrice, strike float64, expiryUnix int64, reason string) {
+	closed, err := p.store.GetPosition(posID)
+	if err != nil || closed.ClosePrice == nil || closed.RealizedPnL == nil {
+		return
+	}
+	p.shadowMu.Lock()
+	p.shadowRedemptions[posID] = &shadowEntry{
+		instrument:  instrument,
+		units:       units,
+		openPrice:   openPrice,
+		strike:      strike,
+		expiryUnix:  expiryUnix,
+		actualClose: *closed.ClosePrice,
+		actualPnl:   *closed.RealizedPnL,
+		closeReason: reason,
+	}
+	p.shadowMu.Unlock()
+}
+
+// checkShadowRedemptions logs the TP/SL-vs-redemption comparison for any
+// early-exited trade whose contract has now actually expired, using the same
+// spot-vs-strike settlement rule as ResolvePosition. Pure logging: no balance
+// or position mutation — the real exit already happened at record time.
+func (p *PolymarketEngine) checkShadowRedemptions() {
+	now := time.Now().Unix()
+
+	p.shadowMu.Lock()
+	var due []string
+	for id, e := range p.shadowRedemptions {
+		if now >= e.expiryUnix {
+			due = append(due, id)
+		}
+	}
+	p.shadowMu.Unlock()
+
+	for _, id := range due {
+		p.shadowMu.Lock()
+		e, ok := p.shadowRedemptions[id]
+		if ok {
+			delete(p.shadowRedemptions, id)
+		}
+		p.shadowMu.Unlock()
+		if !ok {
+			continue
+		}
+
+		spotPrice, hasSpot := p.GetPrice("BTC_USD")
+		if !hasSpot {
+			p.store.Log("WARN", fmt.Sprintf("[Shadow Redemption] pos=%s: no spot price available at expiry — skipping comparison.", id))
+			continue
+		}
+
+		isLong := e.units > 0
+		won := (isLong && spotPrice >= e.strike) || (!isLong && spotPrice < e.strike)
+		resolutionPrice := 0.0
+		if won {
+			resolutionPrice = 1.0
+		}
+
+		shares := math.Abs(e.units)
+		shadowGross := shares * (resolutionPrice - e.openPrice)
+		entryFee := takerFee(shares, e.openPrice)
+		shadowPnl := shadowGross - entryFee // redemption is free — no exit fee
+
+		diff := shadowPnl - e.actualPnl
+		better := "early exit"
+		if diff > 0 {
+			better = "redemption"
+		}
+		p.store.Log("INFO", fmt.Sprintf(
+			"[Shadow Redemption] pos=%s reason=%s | actual: closed @ $%.3f pnl=$%.3f | hold-to-redemption: spot $%.2f vs strike $%.2f -> settle $%.2f pnl=$%.3f | diff=$%.3f (%s would have been better)",
+			id, e.closeReason, e.actualClose, e.actualPnl, spotPrice, e.strike, resolutionPrice, shadowPnl, diff, better))
+	}
+}
+
+// RecordNearMiss files a sub-threshold setup (edge just under the floor, but
+// otherwise tradeable) to be scored at settlement. Deduped to one per contract
+// (the first near-miss seen), matching how the real strategy takes at most one
+// entry per contract. See nearMissEntry.
+func (p *PolymarketEngine) RecordNearMiss(instrument, side string, edge, buyPrice, strike float64, expiryUnix int64) {
+	cond := conditionID(instrument)
+	p.nearMissMu.Lock()
+	defer p.nearMissMu.Unlock()
+	if _, exists := p.nearMisses[cond]; exists {
+		return
+	}
+	p.nearMisses[cond] = &nearMissEntry{
+		side:       side,
+		edge:       edge,
+		buyPrice:   buyPrice,
+		strike:     strike,
+		expiryUnix: expiryUnix,
+		recordedAt: time.Now(),
+	}
+}
+
+// checkNearMisses scores any recorded near-miss whose contract has expired,
+// logging what taking it would have returned (hold-to-settlement, entry fee
+// only). Same spot-vs-strike settlement rule as ResolvePosition. Pure logging;
+// prunes stale entries so the map can't grow unbounded.
+func (p *PolymarketEngine) checkNearMisses() {
+	now := time.Now().Unix()
+
+	p.nearMissMu.Lock()
+	var due []string
+	for cond, e := range p.nearMisses {
+		if now >= e.expiryUnix {
+			due = append(due, cond)
+		} else if now-e.expiryUnix > 600 || (e.expiryUnix == 0 && time.Since(e.recordedAt) > 10*time.Minute) {
+			delete(p.nearMisses, cond) // stale/malformed — drop
+		}
+	}
+	p.nearMissMu.Unlock()
+
+	for _, cond := range due {
+		p.nearMissMu.Lock()
+		e, ok := p.nearMisses[cond]
+		if ok {
+			delete(p.nearMisses, cond)
+		}
+		p.nearMissMu.Unlock()
+		if !ok {
+			continue
+		}
+
+		spot, hasSpot := p.GetPrice("BTC_USD")
+		if !hasSpot {
+			p.store.Log("WARN", fmt.Sprintf("[Near-Miss] cond=%s: no spot at settlement — cannot score.", cond[:min(10, len(cond))]))
+			continue
+		}
+		yesWon := spot >= e.strike
+		won := (e.side == "YES" && yesWon) || (e.side == "NO" && !yesWon)
+		shares := 4.0 / e.buyPrice
+		payout := 0.0
+		if won {
+			payout = 1.0
+		}
+		entryFee := takerFee(shares, e.buyPrice)
+		settleNet := (payout-e.buyPrice)*shares - entryFee
+		outcome := "LOST"
+		if won {
+			outcome = "WON"
+		}
+		p.store.Log("INFO", fmt.Sprintf(
+			"[Near-Miss] cond=%s side=%s edge=$%.3f buy=$%.3f | settlement: spot $%.2f vs strike $%.2f -> our side %s | if-taken(hold-to-settle) net=$%.3f",
+			cond[:min(10, len(cond))], e.side, e.edge, e.buyPrice, spot, e.strike, outcome, settleNet))
+	}
+}
+
 func (p *PolymarketEngine) UpdatePrices(prices map[string]float64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -573,6 +789,35 @@ func (p *PolymarketEngine) GetEnvironment() string {
 		return "live"
 	}
 	return "demo"
+}
+
+// StrategyEnabled reports whether a strategy tag ("s1"/"s2"/"s3") should place
+// trades this tick. In PAPER mode (POLY_LIVE != true) everything runs. In LIVE
+// mode ONLY the strategies named in the LIVE_STRATEGIES env var run — so a
+// single proven strategy (e.g. LIVE_STRATEGIES=s3) can go to real money while
+// the rest stay parked. This is a hard gate at the entry point, and it also
+// avoids a paper/live balance-tracker collision: with S1/S2 gated off in live
+// mode, only the live strategy touches the (real-balance-synced) wallet
+// account. Fail-safe: live mode with an empty allowlist trades NOTHING.
+func (p *PolymarketEngine) StrategyEnabled(tag string) bool {
+	// Hard kill-list, honored in BOTH paper and live — used to fully retire a
+	// dead strategy (e.g. S3, confirmed unfillable) so it stops polluting the
+	// paper sample. Set DISABLED_STRATEGIES=s3 (comma-separated) in .env.
+	for _, t := range strings.Split(os.Getenv("DISABLED_STRATEGIES"), ",") {
+		if strings.EqualFold(strings.TrimSpace(t), tag) {
+			return false
+		}
+	}
+	if !p.liveTrading {
+		return true
+	}
+	allow := os.Getenv("LIVE_STRATEGIES")
+	for _, t := range strings.Split(allow, ",") {
+		if strings.EqualFold(strings.TrimSpace(t), tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *PolymarketEngine) GetPrice(instrument string) (float64, bool) {
@@ -702,7 +947,15 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		// Skipped for hold-to-redemption positions (instrument tagged "_s2") — those
 		// are DESIGNED to ride into settlement and redeem for free; forcing them out
 		// here would defeat the entire strategy. See ResolvePosition.
-		holdToRedemption := strings.HasSuffix(pos.Instrument, "_s2")
+		// _s2: late-window decisive hold. _s3y/_s3n: the two legs of a
+		// dislocation-arb pair — both MUST reach settlement (exactly one pays
+		// $1; flattening either leg early would unhedge the pair). _s4: final-30s
+		// favorite hold — enters INSIDE this 90s window by design, so without
+		// this exemption every S4 position would be force-flattened the tick
+		// after it opened.
+		holdToRedemption := strings.HasSuffix(pos.Instrument, "_s2") ||
+			strings.HasSuffix(pos.Instrument, "_s3y") || strings.HasSuffix(pos.Instrument, "_s3n") ||
+			strings.HasSuffix(pos.Instrument, "_s4")
 		if !holdToRedemption && expiryUnix-time.Now().Unix() <= 90 {
 			p.mu.RLock()
 			yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
@@ -720,12 +973,22 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 				delete(p.slStates, pos.ID)
 				p.mu.Unlock()
 				_ = p.ClosePosition(pos.ID, closePx)
+				p.recordShadowFromClosed(pos.ID, pos.Instrument, pos.Units, pos.OpenPrice, strike, expiryUnix, "SCALP_FLATTEN")
 				continue
 			}
 		}
 
 		// 1. Expiration check: check if expiration time is reached
 		if time.Now().Unix() >= expiryUnix {
+			if p.liveTrading {
+				// Live mode: settlement is an on-chain event, not local bookkeeping.
+				// Route through the CTF redemption flow, which waits for the oracle,
+				// redeems winners from the proxy wallet, and only then books the
+				// settlement (losers book $0 without spending gas). Deduped +
+				// backoff internally, so calling every tick is safe.
+				p.startLiveRedemption(pos)
+				continue
+			}
 			p.store.Log("INFO", fmt.Sprintf("[Polymarket Engine] Live Contract Expiration Reached for %s. Resolving...", pos.ID))
 
 			// Get current spot price of BTC
@@ -765,30 +1028,98 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 		// redemption — our own data shows BTC can reverse meaningfully even with
 		// under a minute left (one contract went from 86% one way to 29% the other
 		// within two minutes), so "looked decided at entry" is not a guarantee.
-		if holdToRedemption {
-			if spotPrice, hasSpot := p.GetPrice("BTC_USD"); hasSpot {
-				isLong := pos.Units > 0
-				stillFavored := (isLong && spotPrice >= strike) || (!isLong && spotPrice < strike)
-				if !stillFavored {
-					shares := math.Abs(pos.Units)
-					bailPrice := 0.0
-					if bp, ok, err := p.GetMarketablePrice(isLong, 1, shares); err == nil && ok {
-						bailPrice = bp
-					} else {
-						p.mu.RLock()
-						yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
-						p.mu.RUnlock()
-						if hasPx {
-							bailPrice = yesPx
-							if !isLong {
-								bailPrice = 1.0 - yesPx
-							}
+		// Bail-out applies ONLY to S2 (a directional hold). S3 pair legs are
+		// hedged — one leg is ALWAYS "on the wrong side of the strike" by
+		// construction, and bailing it would unhedge the locked profit.
+		//
+		// Two triggers, whichever fires first:
+		//  (a) PRICE STOP — the held side's sellable price falls to
+		//      s2BailTokenPrice ($0.50). This CAPS the loss at ~(entry-0.50)/share
+		//      instead of riding a reversal to a $0 redemption. Priced off the
+		//      real book (GetMarketablePrice), never the noisy tape.
+		//  (b) SPOT REVERSAL — BTC re-crosses the strike (backstop for the case
+		//      where the book is stale but the underlying has clearly flipped).
+		if holdToRedemption && strings.HasSuffix(pos.Instrument, "_s2") {
+			isLong := pos.Units > 0
+			shares := math.Abs(pos.Units)
+			tokenPx, pxOk, _ := p.GetMarketablePrice(isLong, 1, shares)
+			spotPrice, hasSpot := p.GetPrice("BTC_USD")
+			spotReversed := hasSpot && !((isLong && spotPrice >= strike) || (!isLong && spotPrice < strike))
+			hitStop := pxOk && tokenPx <= s2BailTokenPrice
+			if hitStop || spotReversed {
+				bailPrice := tokenPx
+				if !pxOk {
+					p.mu.RLock()
+					yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
+					p.mu.RUnlock()
+					if hasPx {
+						bailPrice = yesPx
+						if !isLong {
+							bailPrice = 1.0 - yesPx
 						}
 					}
-					p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] S2 reversal bail-out: spot $%.2f no longer favors held side (strike $%.2f) for %s. Selling at $%.3f instead of risking a $0 redemption.", spotPrice, strike, pos.ID, bailPrice))
-					_ = p.ClosePosition(pos.ID, bailPrice)
-					continue
 				}
+				reason := fmt.Sprintf("spot $%.2f reversed across strike $%.2f", spotPrice, strike)
+				if hitStop {
+					reason = fmt.Sprintf("token hit $%.2f price stop", s2BailTokenPrice)
+				}
+				p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] S2 bail-out (%s) for %s. Selling at $%.3f to cap the loss instead of riding to a $0 redemption.", reason, pos.ID, bailPrice))
+				_ = p.ClosePosition(pos.ID, bailPrice)
+				continue
+			}
+		}
+
+		// S4 bail-out. S4 buys whichever side the BOOK favors in the final 30s and
+		// holds blind to redemption. Two triggers, whichever fires first — mirroring
+		// the S2 bail structure above:
+		//
+		//  (a) SIDE FLIP — the side we hold is no longer the market's favorite
+		//      (its mid has fallen below the other side's). This is the exact
+		//      negation of S4's own entry rule, so it needs no tuned threshold:
+		//      we entered because our side led, we leave when it stops leading.
+		//
+		//  (b) SPOT REVERSAL (backstop) — BTC has crossed to the wrong side of
+		//      the strike. Covers the case where the book is unreadable/stale,
+		//      and independently catches the failure mode that produced both
+		//      real live losses: the book favored one side while our own spot
+		//      feed said the opposite, and spot was right both times.
+		//
+		// Sells at the live bid via ClosePosition. Note this fires only BEFORE
+		// expiry (the expiry branch above `continue`s), so it can never price
+		// against the next contract's book after token IDs rotate.
+		if holdToRedemption && strings.HasSuffix(pos.Instrument, "_s4") {
+			isLong := pos.Units > 0
+
+			sideFlipped := false
+			if hBid, hAsk, okH := p.GetTopOfBook(isLong); okH {
+				if oBid, oAsk, okO := p.GetTopOfBook(!isLong); okO {
+					sideFlipped = (hBid+hAsk)/2 < (oBid+oAsk)/2
+				}
+			}
+
+			spotPrice, hasSpot := p.GetPrice("BTC_USD")
+			spotReversed := hasSpot && !((isLong && spotPrice >= strike) || (!isLong && spotPrice < strike))
+
+			if sideFlipped || spotReversed {
+				bailPrice, pxOk, _ := p.GetMarketablePrice(isLong, 1, math.Abs(pos.Units))
+				if !pxOk {
+					p.mu.RLock()
+					yesPx, hasPx := p.prices[priceKey(pos.Instrument)]
+					p.mu.RUnlock()
+					if hasPx {
+						bailPrice = yesPx
+						if !isLong {
+							bailPrice = 1.0 - yesPx
+						}
+					}
+				}
+				reason := fmt.Sprintf("spot $%.2f crossed strike $%.2f", spotPrice, strike)
+				if sideFlipped {
+					reason = "held side lost the lead (side flip)"
+				}
+				p.store.Log("WARN", fmt.Sprintf("[Polymarket Engine] S4 bail-out (%s) for %s. Selling at $%.3f rather than riding to a $0 settlement.", reason, pos.ID, bailPrice))
+				_ = p.ClosePosition(pos.ID, bailPrice)
+				continue
 			}
 		}
 
@@ -846,9 +1177,10 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 			// often means a directional move is still running, and re-entering
 			// immediately just buys back into the same move (observed 6 stop-outs on
 			// one contract in ~15s before this was added).
-			p.lastStopCloseTime[conditionID(pos.Instrument)] = time.Now()
+			p.lastStopCloseTime[cooldownKey(pos.Instrument)] = time.Now()
 			p.mu.Unlock()
 			_ = p.ClosePosition(pos.ID, slTrigger)
+			p.recordShadowFromClosed(pos.ID, pos.Instrument, pos.Units, pos.OpenPrice, strike, expiryUnix, "SL")
 			continue
 		}
 
@@ -860,6 +1192,7 @@ func (p *PolymarketEngine) EvaluatePositionTriggers() error {
 			delete(p.slStates, pos.ID) // Clear any SL states
 			p.mu.Unlock()
 			_ = p.ClosePosition(pos.ID, price)
+			p.recordShadowFromClosed(pos.ID, pos.Instrument, pos.Units, pos.OpenPrice, strike, expiryUnix, "TP")
 			continue
 		}
 	}
@@ -885,6 +1218,12 @@ func stringsHasPrefix(s, prefix string) bool {
 // bid. Beyond this the FOK is priced at the floor (usually won't fill) so the position
 // holds and retries rather than dumping into a collapsing/transient-thin book.
 const maxExitSlippage = 0.10
+
+// s2BailTokenPrice is the price stop for a held S2 (buffer-strategy) position:
+// if the side we bought can only be sold at or below this, cut it — capping the
+// loss at ~(entry-0.50)/share rather than riding a reversal to a $0 redemption.
+// See the S2 bail-out in EvaluatePositionTriggers.
+const s2BailTokenPrice = 0.50
 
 // cryptoTakerFeeRate is Polymarket's documented taker fee rate for the Crypto
 // market category (our BTC Up/Down contracts): fee = shares * rate * price *
@@ -921,11 +1260,30 @@ func conditionID(instrument string) string {
 	return instrument
 }
 
+// cooldownKey is like conditionID but ALSO includes any trailing strategy/variant
+// suffix (parts beyond the expiry at index 5 — e.g. "_v05", "_s2"), so the
+// re-entry cooldown is tracked PER VARIANT. The three parallel S1 threshold
+// variants (v05/v08/v12) trade the same contract simultaneously; without this,
+// one variant stopping out would suppress re-entry for the others and
+// contaminate the A/B/C comparison. Kept separate from conditionID because the
+// redemption path needs the pure on-chain condition hex.
+func cooldownKey(instrument string) string {
+	parts := strings.Split(instrument, "_")
+	if len(parts) < 2 {
+		return instrument
+	}
+	key := parts[1]
+	if len(parts) >= 7 {
+		key += "_" + strings.Join(parts[6:], "_")
+	}
+	return key
+}
+
 // InCooldown reports whether the contract behind `instrument` is still within
 // the post-stop-loss re-entry cooldown, and how much time remains.
 func (p *PolymarketEngine) InCooldown(instrument string) (remaining time.Duration, active bool) {
 	p.mu.RLock()
-	t, ok := p.lastStopCloseTime[conditionID(instrument)]
+	t, ok := p.lastStopCloseTime[cooldownKey(instrument)]
 	p.mu.RUnlock()
 	if !ok {
 		return 0, false
@@ -1023,6 +1381,18 @@ func (p *PolymarketEngine) SubscribeToMarketTokens(yesToken, noToken, marketAddr
 
 	conn := p.wsConn
 	p.mu.Unlock()
+
+	// Bound the shadow-redemption map: a shadow entry should always be drained by
+	// checkShadowRedemptions within a few seconds of its expiry, but if spot price
+	// is ever unavailable at that moment it stays pending forever — drop anything
+	// stale enough that it can no longer be a useful comparison anyway.
+	p.shadowMu.Lock()
+	for id, e := range p.shadowRedemptions {
+		if time.Now().Unix()-e.expiryUnix > 300 {
+			delete(p.shadowRedemptions, id)
+		}
+	}
+	p.shadowMu.Unlock()
 
 	// If tokens changed and we have a connection, close the connection
 	// to trigger an immediate reconnect and clean subscription to the new tokens

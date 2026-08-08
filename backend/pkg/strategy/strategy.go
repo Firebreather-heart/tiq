@@ -49,6 +49,17 @@ type Runner struct {
 	// every tick of a window trades against the same number. See resolveStrike.
 	strikeCache   map[int64]float64
 	strikeCacheMu sync.Mutex
+	// Push-based Binance spot feed (see binance_feed.go). While enabled, ALL
+	// price inputs (spot/candles/strike) come from Binance — same-source rule.
+	binanceFeed *BinanceFeed
+	feedOnce    sync.Once
+	// tickMu serializes strategy ticks: the 1s loop and feed-forced ticks
+	// (spot-jump bursts) must never run the tick body concurrently.
+	tickMu sync.Mutex
+	// Gamma market-info cache: contract metadata is static for a whole 5-min
+	// window, so refetching it every second was pure data burn (~400MB/day).
+	gammaCache     *PolymarketMarketInfo
+	gammaFetchedAt time.Time
 }
 
 func NewRunner(cfg Config, store *db.DB, oClient *oanda.Client, aClient interface{}, eng engine.ExecutionEngine) *Runner {
@@ -81,8 +92,40 @@ func (r *Runner) UpdateConfig(newCfg Config) {
 	r.store.Log("INFO", fmt.Sprintf("Config updated: Instrument=%s, TradingEnabled=%t, UseAllora=%t", newCfg.Instrument, newCfg.TradingEnabled, newCfg.UseAllora))
 }
 
-// Tick executes a single strategy step
+// Tick executes a single strategy step. Serialized: the 1s loop and
+// feed-forced burst ticks must not interleave (shared candle/strike caches).
 func (r *Runner) Tick() error {
+	r.tickMu.Lock()
+	defer r.tickMu.Unlock()
+	return r.tick()
+}
+
+// ForceTick runs a tick immediately if one isn't already running — called by
+// the Binance feed on large spot jumps so bursts are evaluated the moment they
+// happen instead of up to a second later. Skipping when busy is correct: a
+// tick already in flight is reading the same fresh price.
+func (r *Runner) ForceTick() {
+	if !r.tickMu.TryLock() {
+		return
+	}
+	defer r.tickMu.Unlock()
+	_ = r.tick()
+}
+
+// ensureBinanceFeed lazily starts the push feed the first time a crypto tick
+// runs (no-op when BINANCE_FEED=off).
+func (r *Runner) ensureBinanceFeed() {
+	r.feedOnce.Do(func() {
+		if !FeedEnabled() {
+			r.store.Log("INFO", "[Binance Feed] Disabled via BINANCE_FEED=off — using legacy Kraken polling.")
+			return
+		}
+		r.binanceFeed = NewBinanceFeed(r.store, r.ForceTick)
+		go r.binanceFeed.Start()
+	})
+}
+
+func (r *Runner) tick() error {
 	r.cfgMu.RLock()
 	cfg := r.cfg
 	r.cfgMu.RUnlock()
@@ -91,6 +134,8 @@ func (r *Runner) Tick() error {
 	}
 
 	if polyEng, ok := r.engine.(*engine.PolymarketEngine); ok {
+		r.ensureBinanceFeed()
+
 		var latestATR float64
 		var currentPrice float64
 		var candles []oanda.Candle
@@ -125,7 +170,11 @@ func (r *Runner) Tick() error {
 		} else {
 			latestATR = r.cachedATR
 			candles = r.cachedCandles
-			if price, ok := r.engine.GetPrice(r.cfg.Instrument); ok {
+			// Freshest first: the pushed feed price beats the engine's 1s-loop
+			// copy, which beats a candle close.
+			if fp, ok := r.feedPrice(); ok {
+				currentPrice = fp
+			} else if price, ok := r.engine.GetPrice(r.cfg.Instrument); ok {
 				currentPrice = price
 			} else {
 				latestCandle := candles[len(candles)-1]
@@ -148,9 +197,22 @@ func (r *Runner) Tick() error {
 		_ = polyEng.UpdatePrices(prices)
 		latestATR = r.cachedATR
 
-		// Fetch exact live Polymarket strike and expiration from real contracts
-		r.store.Log("INFO", "[Polymarket] Querying active BTC contracts directly from Polymarket Gamma API...")
-		liveMarket, err := FetchActivePolymarketStrike(currentPrice)
+		// Fetch exact live Polymarket strike and expiration from real contracts.
+		// Contract metadata (tokens/strike window/expiry) is static for a whole
+		// 5-minute window, so cache it and refresh every 15s (per-tick EV prices
+		// prefer the CLOB WS feed anyway) — refetching every second was ~400MB/day.
+		var liveMarket *PolymarketMarketInfo
+		var err error
+		if r.gammaCache != nil && time.Now().Before(r.gammaCache.Expiration) && time.Since(r.gammaFetchedAt) < 15*time.Second {
+			liveMarket = r.gammaCache
+		} else {
+			r.store.Log("INFO", "[Polymarket] Querying active BTC contracts directly from Polymarket Gamma API...")
+			liveMarket, err = FetchActivePolymarketStrike(currentPrice)
+			if err == nil && liveMarket != nil {
+				r.gammaCache = liveMarket
+				r.gammaFetchedAt = time.Now()
+			}
+		}
 
 		var strike float64
 		var expiration time.Time
@@ -548,6 +610,26 @@ func (r *Runner) resolveStrike(liveMarket *PolymarketMarketInfo, candles []oanda
 		return s, true
 	}
 
+	// Binance feed path (same-source rule): the strike must come from Binance
+	// like the live spot does, so the USDT basis cancels out of spot-minus-
+	// strike. Authoritative REST kline open first; the synthetic stream
+	// candle's open (±1 tick of the true open) as fallback; NEVER a Kraken
+	// candle — and if neither is available yet, skip (caller retries next tick).
+	if FeedEnabled() {
+		if r.binanceFeed != nil {
+			if open, ok := r.binanceFeed.WindowOpen(startTS); ok {
+				return cache(open)
+			}
+			for _, c := range r.binanceFeed.Candles(3) {
+				if c.Time.Unix() == startTS {
+					r.store.Log("INFO", fmt.Sprintf("[Polymarket] Using stream-candle open $%.2f as strike for window %d (authoritative kline not published yet).", c.Open, startTS))
+					return cache(c.Open)
+				}
+			}
+		}
+		return 0, false
+	}
+
 	// 2. exact-window candle in the current set
 	for _, c := range candles {
 		if c.Time.Unix() == startTS {
@@ -566,12 +648,15 @@ func (r *Runner) resolveStrike(liveMarket *PolymarketMarketInfo, candles []oanda
 		}
 	}
 
-	// 4. early enough in the window that live spot ≈ the open
-	if elapsed := time.Now().Unix() - startTS; elapsed >= 0 && elapsed <= 30 && currentPrice > 0 {
-		r.store.Log("INFO", fmt.Sprintf("[Polymarket] Using live spot $%.2f as strike proxy for window %d (%ds after open; exact candle not yet published).", currentPrice, startTS, elapsed))
-		return cache(currentPrice)
-	}
-
+	// Otherwise the exact-window candle simply isn't published yet — give up and
+	// let the caller skip. We deliberately do NOT fall back to a live-spot proxy:
+	// measured against real data, spot at window-open can differ from the true
+	// candle open by up to ~$90 (our spot feed itself lags), which is the exact
+	// class of error this whole fix exists to eliminate. The candle appears
+	// within ~30s every time, and the entry window is 150s wide, so skipping the
+	// first few seconds costs no real entries and guarantees every entry trades
+	// against the true strike. (Once cached above, the strike is pinned for the
+	// rest of the window, so this only ever gates the very start.)
 	return 0, false
 }
 
@@ -680,6 +765,14 @@ func calculateATR(highs, lows, closes []float64, period int) []float64 {
 	return atr
 }
 
+// feedPrice returns the pushed Binance price when the feed is running and fresh.
+func (r *Runner) feedPrice() (float64, bool) {
+	if r.binanceFeed == nil {
+		return 0, false
+	}
+	return r.binanceFeed.Price()
+}
+
 func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error) {
 	var candles []oanda.Candle
 	var err error
@@ -687,7 +780,34 @@ func (r *Runner) GetCandles(instrument string, count int) ([]oanda.Candle, error
 	instUpper := strings.ToUpper(instrument)
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 
-	// Fetch live crypto candles from Kraken via proxy
+	if isCrypto && FeedEnabled() {
+		// Same-source rule: with the Binance feed on, candles must be Binance
+		// too (in-memory synthetic history, zero network; REST as bootstrap
+		// fallback). Never mix in Kraken here — its ~$70 USD-vs-USDT basis
+		// would flow straight into the spot-minus-strike signal.
+		if r.binanceFeed != nil {
+			// Only trust the in-memory history when it's actually deep enough for
+			// the indicator stack; a short history (e.g. bootstrap failed during a
+			// network outage) must fall through to the REST fetch below, otherwise
+			// every tick errors on "insufficient candles" while a working REST
+			// endpoint sits unused (bit us during the Jul 15 Binance DNS block).
+			if c := r.binanceFeed.Candles(count); len(c) >= count {
+				candles = c
+			}
+		}
+		if len(candles) == 0 {
+			candles, err = fetchBinanceCandles(instrument, count)
+			if err != nil {
+				return nil, fmt.Errorf("binance candles unavailable (feed cold, REST failed: %w) — refusing Kraken fallback to keep spot/strike same-source", err)
+			}
+		}
+		if len(candles) > 0 {
+			r.engine.UpdatePrices(map[string]float64{instrument: candles[len(candles)-1].Close})
+		}
+		return candles, nil
+	}
+
+	// Legacy path (BINANCE_FEED=off): live crypto candles from Kraken via proxy
 	if isCrypto {
 		candles, err = fetchKrakenCandles(instrument, count)
 		if err != nil {
@@ -736,7 +856,7 @@ func fetchBinanceCandles(symbol string, count int) ([]oanda.Candle, error) {
 		binanceSymbol = "ETHUSDT"
 	}
 
-	url := fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%s&interval=5m&limit=%d", binanceSymbol, count)
+	url := fmt.Sprintf("%s/api/v3/klines?symbol=%s&interval=5m&limit=%d", binanceREST, binanceSymbol, count)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
@@ -985,6 +1105,25 @@ func (r *Runner) LiveTick() error {
 	isCrypto := strings.Contains(instUpper, "BTC") || strings.Contains(instUpper, "ETH")
 
 	if isCrypto {
+		if FeedEnabled() {
+			// Push feed is the source of truth; this 1s loop just mirrors it
+			// into the engine's price map (expiry resolution, S2 reversal bail).
+			// If the stream is momentarily stale, gap-cover with a Binance REST
+			// read — same source only, never Kraken (USD-vs-USDT basis).
+			if r.binanceFeed != nil {
+				price, fresh := r.binanceFeed.Price()
+				if !fresh {
+					if p, err := r.binanceFeed.RefreshREST(); err == nil {
+						price, fresh = p, true
+					}
+				}
+				if fresh && price > 0 {
+					r.engine.UpdatePrices(map[string]float64{cfg.Instrument: price})
+				}
+			}
+			return nil
+		}
+
 		livePrice, err := fetchLivePrice(cfg.Instrument)
 		if err == nil && livePrice > 0 {
 			r.engine.UpdatePrices(map[string]float64{cfg.Instrument: livePrice})

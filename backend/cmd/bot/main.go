@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,8 +27,8 @@ func main() {
 	}
 
 	oandaKey := env["OANDA_KEY"]
-	botMode := env["BOT_MODE"]           // "simulator", "demo" (Oanda Demo), "real" (Oanda Live)
-	instrument := env["INSTRUMENT"]       // e.g. "EUR_USD"
+	botMode := env["BOT_MODE"]      // "simulator", "demo" (Oanda Demo), "real" (Oanda Live)
+	instrument := env["INSTRUMENT"] // e.g. "EUR_USD"
 	dbPath := env["DB_PATH"]
 
 	// Set defaults
@@ -132,9 +133,12 @@ func main() {
 	// 6. Start Ticker in Background
 	go func() {
 		store.Log("INFO", "Background strategy ticker started.")
-		// Oanda standard granularity M5 runs every 5 minutes.
-		// For immediate testing and fast demo simulation, we will run every 1 second.
-		ticker := time.NewTicker(1 * time.Second)
+		// Strategy evaluation cadence. Every 5s (was 1s) to cut external data ~80%
+		// (this loop hits the Gamma API for the active contract on every tick).
+		// Safe for trade quality: the entry window is 150s wide, and SL/TP exits
+		// run on a SEPARATE 1s engine ticker + WebSocket prints, so exit
+		// responsiveness is unaffected by slowing entry evaluation.
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
 		// Run immediate tick on start
@@ -152,7 +156,10 @@ func main() {
 	// 6.5. Start Live Price Ticker in Background
 	go func() {
 		store.Log("INFO", "Background live price ticker started.")
-		liveTicker := time.NewTicker(1 * time.Second)
+		// Live spot poll. Every 5s (was 1s) to cut Kraken-ticker data ~80%. The
+		// spot feeds entry model input and the S2 reversal-bail check; 5s freshness
+		// is ample for both (spot doesn't teleport, and entries have a 150s window).
+		liveTicker := time.NewTicker(5 * time.Second)
 		defer liveTicker.Stop()
 
 		for range liveTicker.C {
@@ -182,6 +189,11 @@ func main() {
 
 	// 7. Start REST API Server
 	serverPort := 8081
+	if v := env["API_PORT"]; v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			serverPort = p
+		}
+	}
 	apiServer := api.NewServer(store, runner, execEngine, serverPort)
 	if err := apiServer.Start(); err != nil {
 		log.Fatalf("Critical: API Server stopped: %v", err)

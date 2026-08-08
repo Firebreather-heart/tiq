@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"tiq/backend/pkg/db"
@@ -30,6 +31,37 @@ func NewPolymarketRunner(cfg PolymarketConfig, store *db.DB, polyEng *engine.Pol
 		store:      store,
 		polyEngine: polyEng,
 	}
+}
+
+// s1Variants defines the parallel A/B/C threshold experiment: three otherwise-
+// identical S1 strategies running simultaneously on every contract, differing
+// only in the edge floor. Positions are tagged with the variant tag (instrument
+// suffix "_v05"/"_v08"/"_v12") so win rate and PnL can be compared per variant.
+// The variants are independent — separate per-contract entry dedup and separate
+// re-entry cooldowns (see cooldownKey) — so one variant's activity can't
+// contaminate another's results. They share the same book, price feed, and the
+// single S2 late-window strategy, which run once per tick regardless.
+var s1Variants = []struct {
+	tag     string
+	minEdge float64
+}{
+	{"v05", 0.05},
+	{"v08", 0.08},
+	{"v12", 0.12},
+}
+
+// hasOpenForVariant reports whether an open position already exists for this
+// contract (condID) tagged with the given variant/strategy suffix (e.g. "_v08",
+// "_s2"). Used for per-variant entry dedup so each variant holds at most one
+// position per contract at a time.
+func hasOpenForVariant(openShares []db.Position, condID, suffix string) bool {
+	for _, pos := range openShares {
+		pp := strings.Split(pos.Instrument, "_")
+		if len(pp) >= 2 && pp[1] == condID && strings.HasSuffix(pos.Instrument, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Tick executes a single 5-minute Polymarket strategy evaluation step
@@ -74,38 +106,50 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 		}
 	}
 
+	// Keep the price feed fresh for any open position on this contract. All
+	// variants + S2 buy the same YES/NO token (priced by condition ID), so this
+	// one update covers every open position. Exits (TP/SL/flatten) are handled
+	// by the engine's book-based EvaluatePositionTriggers loop, NOT here — the
+	// old tape-priced TP that lived here fired on last-trade noise and was
+	// superseded by the book-based trigger.
 	for _, pos := range openShares {
 		posParts := strings.Split(pos.Instrument, "_")
 		if len(posParts) >= 2 && posParts[1] == currentCondID {
-			// Position exists for this contract! Check exit condition.
-			isLong := pos.Units > 0
-			var currentSharePrice float64
-			if isLong {
-				currentSharePrice = marketYesPrice
-			} else {
-				currentSharePrice = marketNoPrice
-			}
-
-			// Update the price of the actual open position's instrument ID (YES price) in the engine feed
-			_ = pr.polyEngine.UpdatePrices(map[string]float64{
-				pos.Instrument: marketYesPrice,
-			})
-			// Scalp take-profit: exit once the token reprices up to the stored catch-up target
-			if pos.TakeProfit > 0 && currentSharePrice >= pos.TakeProfit {
-				pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] Take Profit triggered! Share Price: $%.3f >= Target: $%.3f (Entry: $%.3f). Closing position.",
-					currentSharePrice, pos.TakeProfit, pos.OpenPrice))
-				err = pr.polyEngine.ClosePosition(pos.ID, currentSharePrice)
-				return err
-			}
-			return nil
+			_ = pr.polyEngine.UpdatePrices(map[string]float64{pos.Instrument: marketYesPrice})
 		}
 	}
 
-	// S2: late-window decisive-lag strategy. Operates in the closing seconds, well
-	// outside (and mutually exclusive with) the normal 150-300s entry window below —
-	// no existing position was found on this contract above, so it's safe to check.
+	// S3: two-sided dislocation arb. Checked EVERY tick at any point in the
+	// window (measured events spread evenly across the window) — buys BOTH
+	// tokens when the executable pair cost locks >= s3MinNetPerPair after fees,
+	// then holds to free settlement redemption (exactly one leg pays $1).
+	// Direction-irrelevant by construction; skipped while a pair is open.
+	if pr.polyEngine.StrategyEnabled("s3") && timeRemaining > 5 &&
+		!hasOpenForVariant(openShares, currentCondID, "_s3y") &&
+		!hasOpenForVariant(openShares, currentCondID, "_s3n") {
+		if err := pr.tryS3Entry(currentCondID); err != nil {
+			return err
+		}
+	}
+
+	// S2: late-window decisive-lag strategy. Runs ONCE per tick (not per S1
+	// variant), only if no S2 position is already open on this contract.
+	// Operates in the closing seconds, mutually exclusive with the 150-300s S1
+	// entry window below. S4's window (<=30s) is a subset of this one, so it's
+	// evaluated here too instead of behind an early return — otherwise S4 would
+	// never get a chance to run.
 	if timeRemaining <= s2MaxTimeRemaining {
-		return pr.tryS2Entry(currentPrice, atr, timeRemaining, marketYesPrice, marketNoPrice)
+		if pr.polyEngine.StrategyEnabled("s2") && !hasOpenForVariant(openShares, currentCondID, "_s2") {
+			if err := pr.tryS2Entry(currentPrice, atr, timeRemaining, marketYesPrice, marketNoPrice); err != nil {
+				return err
+			}
+		}
+		if timeRemaining <= s4MaxTimeRemaining {
+			if pr.polyEngine.StrategyEnabled("s4") && !hasOpenForVariant(openShares, currentCondID, "_s4") {
+				return pr.tryS4Entry(currentPrice, timeRemaining)
+			}
+		}
+		return nil
 	}
 
 	// Entry window: from contract open (~300s) down to 150s remaining. This leaves >=60s of
@@ -186,19 +230,47 @@ func (pr *PolymarketRunner) Tick(currentPrice float64, atr float64, isBullishTre
 		return err
 	}
 
-	// Fixed risk of $5 USDC per trade as requested by the user
-	riskCapital := 5.00
+	// Fixed dollar risk per trade. $4 (down from $5) to stretch an ~$11.7 live
+	// balance while keeping a healthy safety margin. Because we size by dollars,
+	// $4 stays above Polymarket's 5-share orderMinSize up to an entry price of
+	// $0.80 ($4/$0.80 = 5 shares); above that the order rounds below 5 shares and
+	// the CLOB rejects it — but every real entry so far has been <= $0.51, so
+	// there's ample margin. Note: $4 only funds ~2 concurrent open positions on
+	// this balance, which is fine since scalps almost never overlap. S2 keeps its
+	// own s2RiskCapital=$5 (it buys up to $0.93, needing >=$4.65 to clear 5 shares).
+	riskCapital := 4.00
 
-	if yesEV >= pr.cfg.MinExpectedValue {
-		if err := pr.enterLiveEdge(targetInstrument, true, trueYesProbability, marketYesPrice, riskCapital); err != nil {
-			return err
+	// A/B/C threshold experiment: evaluate each variant independently. A variant
+	// enters (buying the tagged instrument "<market>_<tag>") only if it has no
+	// open position on this contract and the EV clears ITS edge floor. Because
+	// the floors are nested (0.05 ⊂ 0.08 ⊂ 0.12), a high-edge setup enters all
+	// three; a marginal one enters only the looser variants — which is exactly
+	// the comparison we want. targetInstrument (the base, no suffix) is retained
+	// only for the price-feed update above.
+	if !pr.polyEngine.StrategyEnabled("s1") {
+		return nil // live mode with S1 not allowlisted — S1 stays parked
+	}
+	anyEntered := false
+	for _, v := range s1Variants {
+		suffix := "_" + v.tag
+		if hasOpenForVariant(openShares, currentCondID, suffix) {
+			continue // this variant already holds a position; engine manages its exit
 		}
-	} else if noEV >= pr.cfg.MinExpectedValue {
-		if err := pr.enterLiveEdge(targetInstrument, false, trueNoProbability, marketNoPrice, riskCapital); err != nil {
-			return err
+		variantInstrument := pr.cfg.MarketAddress + suffix
+		if yesEV >= v.minEdge {
+			anyEntered = true
+			if err := pr.enterLiveEdge(variantInstrument, true, trueYesProbability, marketYesPrice, riskCapital, v.minEdge); err != nil {
+				return err
+			}
+		} else if noEV >= v.minEdge {
+			anyEntered = true
+			if err := pr.enterLiveEdge(variantInstrument, false, trueNoProbability, marketNoPrice, riskCapital, v.minEdge); err != nil {
+				return err
+			}
 		}
-	} else {
-		pr.store.Log("INFO", "[Polymarket Strategy] Expected Value edge insufficient. HOLD/Wait.")
+	}
+	if !anyEntered {
+		pr.store.Log("INFO", "[Polymarket Strategy] Expected Value edge below all variant floors (0.05/0.08/0.12). HOLD/Wait.")
 	}
 
 	return nil
@@ -226,7 +298,7 @@ const (
 //
 // isYes selects the token; feedPrice is the stale price (logging/initial sizing);
 // trueProb is the Black-Scholes fair probability.
-func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, trueProb, feedPrice, riskCapital float64) error {
+func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, trueProb, feedPrice, riskCapital, minEdge float64) error {
 	side := "NO"
 	sign := -1.0
 	if isYes {
@@ -239,13 +311,6 @@ func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, t
 	// Checked first — cheapest gate, no book I/O.
 	if remaining, active := pr.polyEngine.InCooldown(targetInstrument); active {
 		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s entry blocked: contract in re-entry cooldown (%.0fs remaining after a recent stop-loss).", side, remaining.Seconds()))
-		return nil
-	}
-
-	// GATE (probability band): a saturated model probability near a coin-flip
-	// strike is exactly the untrustworthy kind — refuse it.
-	if trueProb > maxTradeProb {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s model prob %.0f%% saturated (> %.0f%%) — untrustworthy near-certain signal, skipping.", side, trueProb*100, maxTradeProb*100))
 		return nil
 	}
 
@@ -263,16 +328,16 @@ func (pr *PolymarketRunner) enterLiveEdge(targetInstrument string, isYes bool, t
 		return nil
 	}
 
-	proceed, liveEdge, reason := checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, pr.cfg.MinExpectedValue)
+	proceed, liveEdge, reason := checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, minEdge)
 	if !proceed {
-		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s entry blocked by guardrail: %s (bid $%.2f / ask $%.2f, buy $%.2f, feed $%.2f).",
-			side, reason, bestBid, bestAsk, buyPrice, feedPrice))
+		pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] %s (floor $%.2f) entry blocked by guardrail: %s (bid $%.2f / ask $%.2f, buy $%.2f, feed $%.2f).",
+			side, minEdge, reason, bestBid, bestAsk, buyPrice, feedPrice))
 		return nil
 	}
 
 	units := sign * riskCapital / buyPrice
-	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] LIVE edge confirmed! Buying %.2f %s @ $%.2f (edge $%.2f; bid $%.2f / ask $%.2f; feed $%.2f). Risk $%.2f.",
-		math.Abs(units), side, buyPrice, liveEdge, bestBid, bestAsk, feedPrice, riskCapital))
+	pr.store.Log("INFO", fmt.Sprintf("[Polymarket Strategy] LIVE edge confirmed [floor $%.2f -> %s]! Buying %.2f %s @ $%.2f (edge $%.2f; bid $%.2f / ask $%.2f; feed $%.2f). Risk $%.2f.",
+		minEdge, targetInstrument, math.Abs(units), side, buyPrice, liveEdge, bestBid, bestAsk, feedPrice, riskCapital))
 
 	// Scalp limits anchored to the real fill price: SL = entry-$0.03, TP = entry + 60% of live edge.
 	_, err = pr.polyEngine.OpenPosition(targetInstrument, units, buyPrice, buyPrice-0.03, buyPrice+0.6*liveEdge)
@@ -320,33 +385,42 @@ func checkEntryGates(trueProb, bestBid, bestAsk, buyPrice, minEdge float64) (pro
 // The extended BookSnapshot logging (spot/strike/dist, every tick, any
 // t_remain) exists specifically to accumulate the data needed to calibrate
 // these numbers properly later.
+// S2 — the "buffer strategy", re-calibrated from a clean historical
+// reconstruction (loganalysis). Buy the decisive favorite in the 1-2 minute
+// window and hold to FREE redemption. What the reconstruction found, at
+// t_remain 60-120s:
+//   - BTC $30-100 clear of strike -> the ~$0.90 favorite won ~95%
+//   - BTC within $30 -> only ~70% (the coin-flip TRAP; excluded)
+//
+// ~95% clears the ~91.6% fee-adjusted breakeven with margin — IF the win rate
+// holds. The confirming sample is small (21-37), so this is a PAPER forward-test
+// to bank 100+ real trades before any live use. Gates are buffer/price-based
+// (what was validated), not the old Black-Scholes-probability gate.
 const (
-	s2MaxTimeRemaining = 60.0 // only operate in the closing seconds
-	s2MinProb          = 0.90 // Black-Scholes-style model confidence floor
-	// Sanity floor independent of the volatility-scaled probability above.
-	// Guards against the exact overconfidence failure minVolPerSec exists to
-	// prevent elsewhere: near-zero measured volatility can make the model
-	// read 99% confident on a real gap that's actually quite small.
-	s2MinAbsDistance = 50.0
-	// Leaves margin over the ~$0.925 fee-adjusted breakeven (taker fee at
-	// $0.93 is cheap, but buying at $0.99 leaves ~nothing to gain).
-	s2MaxEntryPrice = 0.93
-	// Fixed risk size, matching the main strategy's per-trade sizing.
-	s2RiskCapital = 5.00
+	s2MaxTimeRemaining = 120.0 // enter within the last 2 minutes...
+	s2MinTimeRemaining = 45.0  // ...but not so late there's no room to bail
+	s2MinAbsDistance   = 30.0  // BTC must be >= $30 clear of strike (skip the <30 trap)
+	s2MinEntryPrice    = 0.85  // favorite must be priced as a real favorite...
+	s2MaxEntryPrice    = 0.95  // ...up to $0.95, to also catch the decisive $38+ buffer setups
+	//                            the market prices at $0.93-0.95 (breakeven ~91% up there, so
+	//                            these lean on the higher win rate a bigger buffer implies).
+	s2RiskCapital = 2.00 // $2/trade: caps a typical bailed loss under $1 and sizes
+	//                       sanely for an ~$11.75 balance (was $5). Wins shrink to
+	//                       ~$0.17 in step; the win/loss ratio is unchanged.
 )
 
 // checkS2Gates applies S2's pure entry conditions (no I/O), mirroring
 // checkEntryGates' separation so the thresholds are unit-testable independent
 // of book/network calls.
-func checkS2Gates(dist, prob, buyPrice float64) (proceed bool, reason string) {
+func checkS2Gates(dist, buyPrice float64) (proceed bool, reason string) {
 	if math.Abs(dist) < s2MinAbsDistance {
-		return false, fmt.Sprintf("spot-strike distance $%.0f below $%.0f floor — too close to trust this late", dist, s2MinAbsDistance)
+		return false, fmt.Sprintf("buffer $%.0f below $%.0f floor — inside the coin-flip zone", math.Abs(dist), s2MinAbsDistance)
 	}
-	if prob < s2MinProb {
-		return false, fmt.Sprintf("model confidence %.1f%% below %.0f%% floor", prob*100, s2MinProb*100)
+	if buyPrice < s2MinEntryPrice {
+		return false, fmt.Sprintf("favorite only $%.2f (< $%.2f) — market doesn't agree it's decisive", buyPrice, s2MinEntryPrice)
 	}
 	if buyPrice > s2MaxEntryPrice {
-		return false, fmt.Sprintf("book already at $%.2f — no margin left over $%.2f max", buyPrice, s2MaxEntryPrice)
+		return false, fmt.Sprintf("book already at $%.2f — no margin over $%.2f to the $1 redemption", buyPrice, s2MaxEntryPrice)
 	}
 	return true, ""
 }
@@ -356,37 +430,35 @@ func checkS2Gates(dist, prob, buyPrice float64) (proceed bool, reason string) {
 // position already exists on this contract (checked by the caller) and
 // timeRemaining <= s2MaxTimeRemaining.
 func (pr *PolymarketRunner) tryS2Entry(currentPrice, atr, timeRemaining, marketYesPrice, marketNoPrice float64) error {
-	volatilityPerSec := (atr / currentPrice) / math.Sqrt(300.0)
-	if volatilityPerSec < minVolPerSec {
-		volatilityPerSec = minVolPerSec
+	// Enter only in the validated 45-120s window — early enough that the $0.50
+	// price stop still has room to work, late enough to be "decided".
+	if timeRemaining < s2MinTimeRemaining {
+		return nil
 	}
-	d := math.Log(currentPrice/pr.cfg.StrikePrice) / (volatilityPerSec * math.Sqrt(timeRemaining))
-	trueYesProbability := 0.5 * (1.0 + math.Erf(d/math.Sqrt(2.0)))
-	trueNoProbability := 1.0 - trueYesProbability
 
+	// Buffer = how far BTC is (in $) from the strike, in the favored direction.
 	dist := currentPrice - pr.cfg.StrikePrice
 	isYes := dist > 0
-	side, prob, feedPrice := "NO", trueNoProbability, marketNoPrice
+	side, feedPrice := "NO", marketNoPrice
 	if isYes {
-		side, prob, feedPrice = "YES", trueYesProbability, marketYesPrice
+		side, feedPrice = "YES", marketYesPrice
 	}
-
 	if feedPrice <= 0 {
 		return nil
 	}
+
 	estUnits := s2RiskCapital / feedPrice
 	bestBid, bestAsk, buyPrice, ok, err := pr.polyEngine.EvaluateEntryBook(isYes, estUnits)
 	if err != nil || !ok {
-		return nil // book one-sided/thin/unavailable — silent, this is the common case far from the trigger
+		return nil // book one-sided/thin/unavailable — silent, common far from the trigger
 	}
 
-	proceed, reason := checkS2Gates(dist, prob, buyPrice)
+	proceed, reason := checkS2Gates(dist, buyPrice)
 	if !proceed {
-		// Only log the "decisive but priced out" case — useful for tuning
-		// s2MaxEntryPrice. The distance/probability misses are the overwhelming
-		// majority of ticks and would just be noise.
-		if math.Abs(dist) >= s2MinAbsDistance && prob >= s2MinProb {
-			pr.store.Log("INFO", fmt.Sprintf("[S2] %s decisive (prob %.1f%%, dist $%.0f, t_remain=%.0fs) but %s", side, prob*100, dist, timeRemaining, reason))
+		// Log only the "decisive buffer but priced out" case (useful for tuning
+		// the price band); the buffer misses are the overwhelming majority.
+		if math.Abs(dist) >= s2MinAbsDistance {
+			pr.store.Log("INFO", fmt.Sprintf("[S2] %s buffer $%.0f decisive (t_remain=%.0fs, buy $%.2f) but %s", side, math.Abs(dist), timeRemaining, buyPrice, reason))
 		}
 		return nil
 	}
@@ -395,10 +467,316 @@ func (pr *PolymarketRunner) tryS2Entry(currentPrice, atr, timeRemaining, marketY
 	if !isYes {
 		units = -units
 	}
-	pr.store.Log("INFO", fmt.Sprintf("[S2] Decisive late-window entry! Buying %.2f %s @ $%.2f (bid $%.2f/ask $%.2f, model prob %.1f%%, spot-strike dist $%.0f, t_remain=%.0fs). Holding to redemption.",
-		math.Abs(units), side, buyPrice, bestBid, bestAsk, prob*100, dist, timeRemaining))
+	pr.store.Log("INFO", fmt.Sprintf("[S2] Buffer entry! Buying %.2f %s @ $%.2f (bid $%.2f/ask $%.2f, BTC buffer $%.0f, t_remain=%.0fs). Hold to redemption; $0.50 price-stop.",
+		math.Abs(units), side, buyPrice, bestBid, bestAsk, math.Abs(dist), timeRemaining))
 
 	marketAddr := pr.cfg.MarketAddress + "_s2"
 	_, err = pr.polyEngine.OpenPosition(marketAddr, units, buyPrice, 0, 0)
 	return err
+}
+
+// S4: "buy the final-30s favorite" — user's hypothesis, distinct from S2. No
+// buffer floor, no price band: whichever side (YES/NO) is currently priced
+// higher gets bought, at whatever price that is, in the last 30s, held blind
+// to free redemption. No bail-out (per spec: "hold to redemption") — this is
+// deliberately the rawest form of the idea so paper mode measures exactly what
+// was proposed, not a hedged version of it.
+//
+// A historical backtest (backend/cmd/s4backtest, 2008 real contracts over 7
+// days) found this loses money at every price level tested: realized win
+// rate sits at or just below each band's own fee-adjusted breakeven (e.g.
+// $0.60-0.70 band: 65.9% win vs 66.5% breakeven; $0.80-0.90: 84.4% vs 86.1%).
+// That backtest priced entries at the traded/mid price; a real FOK buy pays
+// the ask (1-2c worse), so live fills should be worse still.
+//
+// A 20-trade paper run against real live asks came out +$6.38 (19W/1 exact
+// breakeven), contradicting the backtest. That sample is far too small to
+// settle the disagreement — at these thin per-trade edges a 19/20 run is well
+// within variance — but it was enough for the account owner to take S4 live.
+// The backtest's negative result therefore remains UNREFUTED, not disproven.
+//
+// Taken live 2026-08-02, then shut down the same night: 11 trades, 8W/3L, net
+// ~-$7. All 3 losses shared one signature the 8 wins never had — bought at a
+// near coin-flip book price ($0.54-$0.70) AND our own BTC spot feed disagreed
+// with the book's favorite. Both conditions below are gates added directly in
+// response to that: neither existed in the version that went live and lost.
+const (
+	s4MaxTimeRemaining = 30.0 // enter only in the final 30s, per spec
+	// Fixed SHARE count, not a fixed dollar stake (S2 sizes by dollars). 5 shares
+	// is also exactly Polymarket's orderMinSize for these markets, so no entry can
+	// round below the exchange minimum regardless of price.
+	//
+	// NOTE this makes per-trade exposure price-scaled instead of flat: cost =
+	// 5 * price, so a $0.97 favorite risks ~$4.85 while a $0.30 one risks ~$1.50.
+	// Near $1.00 that is ~2.5x the old flat-$2 exposure, and S4 has NO stop-loss
+	// (it holds blind to redemption), so a losing high-price entry forfeits the
+	// full ~$5.
+	s4FixedShares = 5.0
+
+	// GATE (min price): reject coin-flip "favorites". All 3 live losses bought
+	// at $0.54-$0.70; every live win bought at $0.76+. $0.85 sits with clear
+	// margin above the entire loss cluster — deliberately above the cheapest
+	// historical win ($0.76) too, trading a few thin wins for a hard floor
+	// under every observed loss rather than threading between them.
+	s4MinEntryPrice = 0.85
+
+	// GATE (re-entry guard): at most one entry ATTEMPT per contract. A failed
+	// FOK previously left the contract eligible to retry seconds later on a
+	// still-moving book — observed live as 2-3 attempts on the same contract,
+	// each closer to expiry and further into the price move. 35s outlives the
+	// entire 30s entry window, so by the time it would expire the contract has
+	// already settled and the next one has a different MarketAddress anyway —
+	// this is really "one shot per contract," the duration just needs to clear
+	// the window.
+	s4RetryCooldown = 35 * time.Second
+)
+
+var (
+	s4LastAttemptMu sync.Mutex
+	s4LastAttempt   = map[string]time.Time{} // MarketAddress -> last entry attempt
+)
+
+// checkS4SpotAgreement is the pure spot-agreement gate (see tryS4Entry),
+// separated out so it's unit-testable independent of the book/network calls.
+func checkS4SpotAgreement(isYes, spotFavorsYes bool) (proceed bool, reason string) {
+	if isYes != spotFavorsYes {
+		return false, "book favorite disagrees with our spot feed"
+	}
+	return true, ""
+}
+
+// checkS4Price is the pure minimum-price gate (see tryS4Entry).
+func checkS4Price(buyPrice float64) (proceed bool, reason string) {
+	if buyPrice < s4MinEntryPrice {
+		return false, fmt.Sprintf("price $%.2f below $%.2f floor — not a real favorite", buyPrice, s4MinEntryPrice)
+	}
+	return true, ""
+}
+
+// tryS4Entry buys whichever side is currently priced higher, gated by
+// checkS4SpotAgreement and checkS4Price above plus a per-contract re-entry
+// guard. Only reached when no S4 position already exists on this contract
+// (checked by the caller) and timeRemaining <= s4MaxTimeRemaining.
+//
+// Side selection reads the LIVE BOOK (GetTopOfBook), never the last-trade
+// tape — a stale tape print can disagree sharply with where the book
+// actually sits, especially inside the final 30s where prices move fast. A
+// real paper trade caught this the hard way: the tape said one side was
+// ahead, but the book had it priced at $0.02 (the actual dead underdog) —
+// this function bought whichever side the tape claimed, never re-checking it
+// against the book it then fetched to price the fill. The rest of this
+// codebase already learned this lesson (see the tape-vs-book note in
+// EvaluatePositionTriggers); S4 didn't have it. Fixed by deriving both the
+// side AND the fill price from one live book read.
+func (pr *PolymarketRunner) tryS4Entry(currentPrice, timeRemaining float64) error {
+	// GATE (re-entry guard): at most one attempt per contract, checked first —
+	// cheapest gate, no book I/O.
+	s4LastAttemptMu.Lock()
+	if t, seen := s4LastAttempt[pr.cfg.MarketAddress]; seen && time.Since(t) < s4RetryCooldown {
+		s4LastAttemptMu.Unlock()
+		return nil
+	}
+	s4LastAttemptMu.Unlock()
+
+	yBid, yAsk, okY := pr.polyEngine.GetTopOfBook(true)
+	nBid, nAsk, okN := pr.polyEngine.GetTopOfBook(false)
+	if !okY || !okN {
+		return nil // one-sided/unavailable book — can't compare sides, skip
+	}
+	yMid := (yBid + yAsk) / 2
+	nMid := (nBid + nAsk) / 2
+	isYes := yMid >= nMid
+	side := "NO"
+	if isYes {
+		side = "YES"
+	}
+
+	// GATE (spot agreement): refuse to buy the book's favorite unless our own
+	// BTC spot feed agrees it's actually ahead. On the live data that produced
+	// the losses this fixes, it's a perfect separator: all 8 wins had spot and
+	// book agreeing, all 3 losses had them disagreeing (book still favored the
+	// old side while spot had already crossed to the other one).
+	spotFavorsYes := currentPrice >= pr.cfg.StrikePrice
+	if proceed, reason := checkS4SpotAgreement(isYes, spotFavorsYes); !proceed {
+		pr.store.Log("INFO", fmt.Sprintf("[S4] %s: %s (spot $%.2f vs strike $%.2f) — skipping, t_remain=%.0fs.",
+			side, reason, currentPrice, pr.cfg.StrikePrice, timeRemaining))
+		return nil
+	}
+
+	// Size is a fixed share count, so the depth check asks for exactly what we
+	// intend to buy — no estimate/actual mismatch as with dollar-based sizing.
+	bestBid, bestAsk, buyPrice, ok, err := pr.polyEngine.EvaluateEntryBook(isYes, s4FixedShares)
+	if err != nil || !ok {
+		return nil // book one-sided/thin/unavailable — silent, same as S2/S3
+	}
+
+	// GATE (min price): the book must show real conviction, not a coin flip.
+	if proceed, reason := checkS4Price(buyPrice); !proceed {
+		pr.store.Log("INFO", fmt.Sprintf("[S4] %s: %s. t_remain=%.0fs.", side, reason, timeRemaining))
+		return nil
+	}
+
+	// Past all gates — this is a real attempt. Mark it before submitting so a
+	// slow/failing order can't retry within the same contract's window.
+	s4LastAttemptMu.Lock()
+	s4LastAttempt[pr.cfg.MarketAddress] = time.Now()
+	if len(s4LastAttempt) > 50 { // bound: contracts roll every 5 minutes forever
+		for k, v := range s4LastAttempt {
+			if time.Since(v) > time.Hour {
+				delete(s4LastAttempt, k)
+			}
+		}
+	}
+	s4LastAttemptMu.Unlock()
+
+	units := s4FixedShares
+	if !isYes {
+		units = -units
+	}
+	pr.store.Log("INFO", fmt.Sprintf("[S4] Final-30s entry! Buying %.0f %s @ $%.2f = $%.2f (bid $%.2f/ask $%.2f, spot $%.2f vs strike $%.2f, t_remain=%.0fs). Hold to redemption.",
+		math.Abs(units), side, buyPrice, math.Abs(units)*buyPrice, bestBid, bestAsk, currentPrice, pr.cfg.StrikePrice, timeRemaining))
+
+	marketAddr := pr.cfg.MarketAddress + "_s4"
+	_, err = pr.polyEngine.OpenPosition(marketAddr, units, buyPrice, 0, 0)
+	return err
+}
+
+// S3: two-sided dislocation arbitrage. During fast repricings the two asks
+// momentarily sum below $1 minus fees; buying BOTH sides locks a profit that
+// pays out regardless of direction (a full YES+NO set is worth exactly $1 at
+// settlement, and settlement redemption is free — validated on real account
+// data). Trigger is the NET locked profit per pair at executable (sweep) prices
+// — not a raw sum threshold — so the minimum profit is guaranteed by
+// construction. Measured on 17.7h of clean book snapshots: ~90-100 events/day
+// clear the 2-cent floor, avg depth ~3.9c/pair.
+//
+// PAPER-MODE note on legging risk: live, two FOK orders could half-fill during
+// a violent move, leaving a naked directional leg — that emergency path (retry
+// missing leg, else bail the filled leg) must be built before this goes live.
+// Paper fills are atomic per leg against the real fetched book, so paper
+// results measure opportunity frequency/depth, not legging survival.
+const (
+	s3MinNetPerPair = 0.02  // minimum locked profit per $1-pair, after both entry fees
+	s3PairCapital   = 10.00 // total USDC deployed per event (both legs combined, ~$5/side avg)
+	s3RetryCooldown = 30 * time.Second
+)
+
+var (
+	s3LastTryMu sync.Mutex
+	s3LastTry   = map[string]time.Time{} // condID -> last pair entry (dedupe)
+)
+
+// checkS3Pair is the pure trigger: net locked profit per pair at the given
+// executable buy prices, and whether it clears the floor. Unit-testable.
+func checkS3Pair(buyYes, buyNo float64) (net float64, ok bool) {
+	fee := func(p float64) float64 { return 0.07 * p * (1 - p) }
+	net = 1.0 - (buyYes + buyNo) - fee(buyYes) - fee(buyNo)
+	return net, net >= s3MinNetPerPair
+}
+
+func (pr *PolymarketRunner) tryS3Entry(condID string) error {
+	s3LastTryMu.Lock()
+	if t, seen := s3LastTry[condID]; seen && time.Since(t) < s3RetryCooldown {
+		s3LastTryMu.Unlock()
+		return nil
+	}
+	s3LastTryMu.Unlock()
+
+	estShares := s3PairCapital // ~pair count at sum≈1; close enough for sweep sizing
+	_, _, buyYes, okY, errY := pr.polyEngine.EvaluateEntryBook(true, estShares)
+	if errY != nil || !okY {
+		return nil
+	}
+	_, _, buyNo, okN, errN := pr.polyEngine.EvaluateEntryBook(false, estShares)
+	if errN != nil || !okN {
+		return nil
+	}
+
+	net, ok := checkS3Pair(buyYes, buyNo)
+	if !ok {
+		return nil
+	}
+
+	// Bug-1 fix (share-count mismatch): round BOTH legs to the $0.01 tick the
+	// CLOB actually uses BEFORE sizing. The live path floors each leg to whole
+	// shares via floor(units*price / round(price,¢)); with raw sweep prices the
+	// two legs' rounding ratios differ and can floor to DIFFERENT counts (e.g.
+	// 8 vs 9), leaving a naked, unhedged residual share. With both prices already
+	// cent-aligned the ratio is exactly 1, so both legs floor to floor(shares) —
+	// identical counts, or one FOK cancels cleanly into the legging handler.
+	buyYes = math.Round(buyYes*100) / 100
+	buyNo = math.Round(buyNo*100) / 100
+	if buyYes <= 0 || buyNo <= 0 || buyYes+buyNo <= 0 {
+		return nil
+	}
+
+	// Mark the attempt BEFORE opening so a partial failure can't re-fire every
+	// tick into the same dislocation.
+	s3LastTryMu.Lock()
+	s3LastTry[condID] = time.Now()
+	if len(s3LastTry) > 50 { // bound: contracts roll every 5 minutes forever
+		for k, v := range s3LastTry {
+			if time.Since(v) > time.Hour {
+				delete(s3LastTry, k)
+			}
+		}
+	}
+	s3LastTryMu.Unlock()
+
+	shares := s3PairCapital / (buyYes + buyNo)
+	pr.store.Log("INFO", fmt.Sprintf("[S3] Dislocation arb! Pair sum $%.3f (YES $%.3f + NO $%.3f) locks $%.3f/pair after fees — buying %.2f pairs ($%.2f total). Hold to redemption.",
+		buyYes+buyNo, buyYes, buyNo, net, shares, s3PairCapital))
+
+	// Leg 1 — YES. If it doesn't fill we have ZERO exposure (FOK either fills
+	// fully or cancels); abandon cleanly, no recovery needed.
+	yID, errY := pr.polyEngine.OpenPosition(pr.cfg.MarketAddress+"_s3y", shares, buyYes, 0, 0)
+	if errY != nil {
+		pr.store.Log("INFO", fmt.Sprintf("[S3] YES leg didn't fill (%v) — pair abandoned, no exposure.", errY))
+		return nil
+	}
+
+	// Leg 2 — NO. Success => fully hedged pair.
+	if nID, errN := pr.polyEngine.OpenPosition(pr.cfg.MarketAddress+"_s3n", -shares, buyNo, 0, 0); errN == nil {
+		// Belt-and-suspenders: the cent-rounding above should guarantee equal
+		// fills, but verify the two legs actually hold matching share counts. A
+		// residual here means an unforeseen partial fill left a naked share —
+		// surface it loudly so the live watchdog's naked-leg kill-switch trips.
+		if yPos, e1 := pr.polyEngine.GetPosition(yID); e1 == nil {
+			if nPos, e2 := pr.polyEngine.GetPosition(nID); e2 == nil {
+				if d := math.Abs(yPos.Units) - math.Abs(nPos.Units); math.Abs(d) > 1e-6 {
+					pr.store.Log("CRITICAL", fmt.Sprintf("[S3] HEDGE IMBALANCE: YES %.4f vs NO %.4f shares (residual %.4f) — naked exposure, review immediately.", math.Abs(yPos.Units), math.Abs(nPos.Units), d))
+				}
+			}
+		}
+		return nil
+	} else {
+		// LEGGING EMERGENCY: YES filled but NO didn't — we now hold a NAKED
+		// directional position in the exact volatile moment that created the
+		// dislocation. Priority is to stop being directional, fast. This path is
+		// live-only: in paper both legs always fill, so it never runs there.
+		pr.store.Log("WARN", fmt.Sprintf("[S3] NO leg failed after YES fill (%v) — recovering naked YES leg.", errN))
+
+		// (1) Try once more to complete the hedge at a REFRESHED NO price. Even
+		// if the dislocation closed and the pair is now a small loss, being
+		// hedged (locked, direction-free) beats holding naked risk.
+		if _, _, buyNo2, ok, _ := pr.polyEngine.EvaluateEntryBook(false, shares); ok {
+			buyNo2 = math.Round(buyNo2*100) / 100
+			if _, err2 := pr.polyEngine.OpenPosition(pr.cfg.MarketAddress+"_s3n", -shares, buyNo2, 0, 0); err2 == nil {
+				pr.store.Log("INFO", fmt.Sprintf("[S3] Recovery OK: NO leg filled on retry at $%.3f — pair hedged.", buyNo2))
+				return nil
+			}
+		}
+
+		// (2) Hedge unreachable — FLATTEN the YES leg at the live bid so we exit
+		// flat rather than ride a naked bet.
+		bail := buyYes
+		if bid, okb, errb := pr.polyEngine.GetMarketablePrice(true, 1, shares); errb == nil && okb {
+			bail = bid
+		}
+		pr.store.Log("CRITICAL", fmt.Sprintf("[S3] Recovery failed — flattening naked YES leg %s at $%.3f to kill directional risk.", yID, bail))
+		if err := pr.polyEngine.ClosePosition(yID, bail); err != nil {
+			pr.store.Log("CRITICAL", fmt.Sprintf("[S3] FLATTEN FAILED (%v) — naked YES leg %s STILL OPEN, manual intervention needed.", err, yID))
+		}
+	}
+	return nil
 }

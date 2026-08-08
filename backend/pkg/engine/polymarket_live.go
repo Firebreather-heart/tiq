@@ -390,36 +390,67 @@ func (p *PolymarketEngine) submitLiveBuyOrder(tokenID string, price, usdcBudget 
 	if tickPrice <= 0 || tickPrice >= 1 {
 		return "", 0, 0, fmt.Errorf("price %.4f out of valid range (0,1) after rounding", tickPrice)
 	}
-	shares := math.Floor(usdcBudget / tickPrice)
+	// Epsilon-floor: usdcBudget/tickPrice is often an exact integer in intent
+	// (e.g. 5 shares × $0.47 ÷ $0.47), but IEEE-754 can land it at 4.999999…,
+	// dropping a whole share. That silently unbalances S3's two arb legs (one
+	// floors to N, the other to N-1 → a naked residual). The 1e-9 nudge recovers
+	// the intended integer without ever rounding a genuinely-fractional result
+	// up. Benign for S1/S2 (they'd just occasionally lose a share to the same
+	// underflow).
+	shares := math.Floor(usdcBudget/tickPrice + 1e-9)
 	if shares < 1 {
 		return "", 0, 0, fmt.Errorf("order too small: %.2f USDC at %.2f yields %.2f shares", usdcBudget, tickPrice, usdcBudget/tickPrice)
 	}
-	orderID, err := p.submitLiveOrder(tokenID, tickPrice, shares, 0, "BUY")
+	orderID, taking, making, err := p.submitLiveOrder(tokenID, tickPrice, shares, 0, "BUY")
 	if err != nil {
 		return "", 0, 0, err
+	}
+	// Report the ACTUAL fill, not what we asked for. A marketable FOK can fill
+	// at better-than-limit prices — sweeping a fast-moving book returns MORE
+	// shares for the same USDC. Observed live: a 5-share order at a $0.58 limit
+	// filled 8.7879 shares for $2.90 ($0.33/share) while the book was collapsing.
+	// Returning the requested 5 recorded a position we didn't hold, understating
+	// both the shares owned and any settlement payout on them.
+	if taking > 0 && making > 0 {
+		return orderID, taking, making, nil
 	}
 	return orderID, shares, shares * tickPrice, nil
 }
 
 // submitLiveSellOrder sends a real SELL limit order to the Polymarket CLOB.
 // shares must not exceed the shares actually held (whole shares from the buy fill).
-func (p *PolymarketEngine) submitLiveSellOrder(tokenID string, price, shares float64) (string, error) {
+// Returns the actual USDC proceeds, not just what the limit price implied — a
+// marketable FOK can fill at a better-than-limit price (the buy side proved
+// this: a $0.58-limit buy filled at an $0.33 average once). The caller should
+// price the exit off these real proceeds, not the pre-trade estimate, the same
+// way submitLiveBuyOrder already does for entries.
+func (p *PolymarketEngine) submitLiveSellOrder(tokenID string, price, shares float64) (orderID string, proceeds float64, err error) {
 	tickPrice := math.Round(price*100) / 100
 	if tickPrice <= 0 || tickPrice >= 1 {
-		return "", fmt.Errorf("price %.4f out of valid range (0,1) after rounding", tickPrice)
+		return "", 0, fmt.Errorf("price %.4f out of valid range (0,1) after rounding", tickPrice)
 	}
 	wholeShares := math.Floor(shares)
 	if wholeShares < 1 {
-		return "", fmt.Errorf("sell too small: %.2f shares", shares)
+		return "", 0, fmt.Errorf("sell too small: %.2f shares", shares)
 	}
-	return p.submitLiveOrder(tokenID, tickPrice, wholeShares, 1, "SELL")
+	orderID, taking, making, err := p.submitLiveOrder(tokenID, tickPrice, wholeShares, 1, "SELL")
+	if err != nil {
+		return "", 0, err
+	}
+	// SELL semantics (see submitLiveOrder): making = shares given, taking = USDC
+	// received. taking IS the real proceeds — use it whenever the response
+	// parsed; only fall back to the pre-trade estimate if it didn't.
+	if taking > 0 && making > 0 {
+		return orderID, taking, nil
+	}
+	return orderID, wholeShares * tickPrice, nil
 }
 
 // submitLiveOrder signs and posts a FOK order for a whole number of shares at
 // tickPrice (already rounded to the $0.01 tick by the callers above).
-func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares float64, side uint8, sideStr string) (string, error) {
+func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares float64, side uint8, sideStr string) (orderID string, taking, making float64, err error) {
 	if p.creds == nil || p.privateKey == nil {
-		return "", fmt.Errorf("live trading not initialized")
+		return "", 0, 0, fmt.Errorf("live trading not initialized")
 	}
 
 	// Amounts in 6-decimal units. USDC leg is shares*price so the implied
@@ -439,7 +470,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 
 	tokenBig, ok := new(big.Int).SetString(tokenID, 10)
 	if !ok {
-		return "", fmt.Errorf("invalid tokenID %q", tokenID)
+		return "", 0, 0, fmt.Errorf("invalid tokenID %q", tokenID)
 	}
 
 	// Use crypto/rand for salt — math/rand is deterministic and unsuitable for order security.
@@ -447,7 +478,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 	saltMax := new(big.Int).Lsh(big.NewInt(1), 53)
 	salt, err := crand.Int(crand.Reader, saltMax)
 	if err != nil {
-		return "", fmt.Errorf("generate order salt: %w", err)
+		return "", 0, 0, fmt.Errorf("generate order salt: %w", err)
 	}
 
 	// Maker is always the wallet holding USDC (funder when set, else the EOA).
@@ -488,7 +519,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 
 	sig, err := signEIP712Order(order, p.privateKey, negRisk)
 	if err != nil {
-		return "", fmt.Errorf("EIP-712 sign failed: %w", err)
+		return "", 0, 0, fmt.Errorf("EIP-712 sign failed: %w", err)
 	}
 
 	zeroBytes32Hex := "0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -516,7 +547,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("marshal order: %w", err)
+		return "", 0, 0, fmt.Errorf("marshal order: %w", err)
 	}
 
 	bodyStr := string(bodyBytes)
@@ -524,7 +555,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 
 	req, err := http.NewRequest("POST", p.clobURL+"/order", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", err
+		return "", 0, 0, err
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -532,7 +563,7 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
-		return "", fmt.Errorf("CLOB POST /order failed: %w", err)
+		return "", 0, 0, fmt.Errorf("CLOB POST /order failed: %w", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
@@ -544,17 +575,19 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 		if strings.Contains(string(respBody), "fully filled") {
 			p.logBookContext(tokenID, side, shares, tickPrice)
 		}
-		return "", fmt.Errorf("CLOB returned HTTP %d: %s", resp.StatusCode, string(respBody))
+		return "", 0, 0, fmt.Errorf("CLOB returned HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
-		OrderID    string `json:"orderID"`
-		Status     string `json:"status"`
-		SuccessMsg string `json:"successMsg"`
-		ErrorMsg   string `json:"errorMsg"`
+		OrderID       string `json:"orderID"`
+		Status        string `json:"status"`
+		SuccessMsg    string `json:"successMsg"`
+		ErrorMsg      string `json:"errorMsg"`
+		TakingAmount  string `json:"takingAmount"`
+		MakingAmount  string `json:"makingAmount"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("decode CLOB response: %w (body: %s)", err, string(respBody))
+		return "", 0, 0, fmt.Errorf("decode CLOB response: %w (body: %s)", err, string(respBody))
 	}
 
 	// Log the raw fill response once per order so we can learn the exact schema
@@ -562,15 +595,19 @@ func (p *PolymarketEngine) submitLiveOrder(tokenID string, tickPrice, shares flo
 	p.store.Log("INFO", fmt.Sprintf("[CLOB Fill] raw response: %s", string(respBody)))
 
 	if result.ErrorMsg != "" {
-		return "", fmt.Errorf("CLOB order rejected: %s", result.ErrorMsg)
+		return "", 0, 0, fmt.Errorf("CLOB order rejected: %s", result.ErrorMsg)
 	}
 
 	// FOK may return empty orderID if it cancelled (no matching asks)
 	if result.OrderID == "" && result.Status != "matched" {
-		return "", fmt.Errorf("FOK order not filled (no matching asks at %.2f)", tickPrice)
+		return "", 0, 0, fmt.Errorf("FOK order not filled (no matching asks at %.2f)", tickPrice)
 	}
 
-	return result.OrderID, nil
+	// taking = what we received, making = what we gave (the order's own semantics:
+	// BUY makes USDC/takes shares; SELL makes shares/takes USDC).
+	taking, _ = strconv.ParseFloat(result.TakingAmount, 64)
+	making, _ = strconv.ParseFloat(result.MakingAmount, 64)
+	return result.OrderID, taking, making, nil
 }
 
 // logBookContext fetches the live order book for a token and logs whether our
